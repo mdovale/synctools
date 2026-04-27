@@ -313,7 +313,6 @@ def _plot_pdfs(
     dpi: int,
     fontsize: float,
     linewidth: float,
-    pool: object,
 ) -> None:
     # Time series
     logger.debug("Plotting time series...")
@@ -362,7 +361,7 @@ def _plot_pdfs(
     logger.info("Wrote %s", fpath)
 
     logger.debug("Computing unsynced frequency spectrum...")
-    psd_unsynced = lpsd.lpsd(
+    psd_unsynced = lpsd(
         np.asarray(df["freq_unsynced"], dtype=np.float64),
         fs=fs,
         olap=p_lpsd["olap"],
@@ -373,10 +372,8 @@ def _plot_pdfs(
         order=p_lpsd["order"],
         win=p_lpsd["win"],
         psll=p_lpsd["psll"],
-        return_type="object",
-        pool=pool,
     )
-    psd_synced = lpsd.lpsd(
+    psd_synced = lpsd(
         np.asarray(df["freq_synced"], dtype=np.float64),
         fs=fs,
         olap=p_lpsd["olap"],
@@ -387,8 +384,6 @@ def _plot_pdfs(
         order=p_lpsd["order"],
         win=p_lpsd["win"],
         psll=p_lpsd["psll"],
-        return_type="object",
-        pool=pool,
     )
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
@@ -611,6 +606,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     df1_non_nan = mo1.df[non_nan_columns_df1].copy()
     df2_non_nan = mo2.df[non_nan_columns_df2].copy()
     h1, h2 = int(mo1.header_rows), int(mo2.header_rows)
+    # Header text for the output CSV (read_lines() cannot open .csv.zip as plain text).
+    meta1 = [ln.strip() for ln in mo1.header[:h1]]
+    meta2 = [ln.strip() for ln in mo2.header[:h2]]
 
     del mo1, mo2
 
@@ -715,8 +713,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     os.makedirs(out_parent, exist_ok=True)
 
     logger.info("Writing %s", output_path)
-    meta1 = read_lines(path1, h1)
-    meta2 = read_lines(path2, h2)
     if meta1 and len(meta1) and isinstance(meta1[0], str) and not meta1[0].rstrip().endswith("(Master)"):
         meta1[0] = meta1[0] + " (Master)"
     if meta2 and len(meta2) and isinstance(meta2[0], str) and not meta2[0].rstrip().endswith("(Slave)"):
@@ -733,7 +729,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         df.to_csv(fh, index=False)
 
     if do_plots:
-        _plot_pdfs(resdir, df, fs, p_lpsd, title, figsize, dpi, fontsize, linewidth, pool)
+        _plot_pdfs(resdir, df, fs, p_lpsd, title, figsize, dpi, fontsize, linewidth)
     else:
         logger.info("Skipping plots (--no-plots).")
 
