@@ -7,7 +7,9 @@ from synctools.auxiliary import (
     spectra,
     integral_rms,
     model_timer_deviation_error,
+    convert_frequency_to_detrended_phase_in_time,
     convert_frequency_to_phase_in_time,
+    convert_phase_to_frequency_in_time,
     convert_frequency_to_phase_in_asd,
     crop_data,
 )
@@ -190,6 +192,25 @@ class TestConvertFrequencyToPhase:
         phase_diff = np.diff(phase)
         expected_phase_diff = 2 * np.pi * freq / sample_fs
         assert np.allclose(phase_diff, expected_phase_diff, rtol=1e-10)
+
+    def test_convert_phase_to_frequency_in_time(self, sample_fs):
+        """Test phase to frequency conversion in time domain."""
+        freq = 1.0
+        phase = convert_frequency_to_phase_in_time(freq * np.ones(1000), sample_fs)
+
+        recovered = convert_phase_to_frequency_in_time(phase, sample_fs)
+
+        assert np.isnan(recovered[0])
+        assert np.allclose(recovered[1:], freq)
+
+    def test_convert_frequency_to_detrended_phase_in_time(self, sample_fs):
+        """Test frequency-to-phase residual conversion removes linear drift."""
+        freq = 1.0 + 0.01 * np.sin(2 * np.pi * 0.01 * np.arange(1000) / sample_fs)
+
+        phase = convert_frequency_to_detrended_phase_in_time(freq, sample_fs)
+
+        assert len(phase) == len(freq)
+        assert abs(np.mean(phase)) < 1e-10
     
     def test_convert_frequency_to_phase_in_asd(self):
         """Test frequency ASD to phase ASD conversion."""

@@ -224,14 +224,13 @@ def crop_data(x,y,xmin,xmax):
         xmax: upper bound of x
     """
 
-    x_tmp = []
-    y_tmp = []
-    for i in range(len(x)):
-        if(x[i] >= xmin and x[i] <= xmax):
-            x_tmp.append(x[i])
-            y_tmp.append(y[i])
-            
-    return np.array(x_tmp), np.array(y_tmp)
+    x_arr = np.asarray(x)
+    y_arr = np.asarray(y)
+    if len(x_arr) != len(y_arr):
+        raise ValueError(f"x and y must have same length ({len(x_arr)} vs {len(y_arr)})")
+
+    mask = (x_arr >= xmin) & (x_arr <= xmax)
+    return x_arr[mask], y_arr[mask]
 
 def convert_frequency_to_phase_in_time(
     data: npt.NDArray[np.float64],
@@ -252,6 +251,54 @@ def convert_frequency_to_phase_in_time(
     dt = 1.0/fs
     factor = 2*np.pi*dt
     return factor*np.cumsum(data)
+
+
+def convert_phase_to_frequency_in_time(
+    data: npt.NDArray[np.float64],
+    fs: float,
+    prepend: float = np.nan
+) -> npt.NDArray[np.float64]:
+    """Convert phase to frequency by discrete differentiation.
+
+    Args:
+        data: Phase data to be converted to frequency (rad).
+        fs: Data rate (Hz). Must be > 0.
+        prepend: Value prepended before differencing. Defaults to NaN so the
+                 first sample reflects the missing previous phase sample.
+
+    Returns:
+        Frequency array (Hz).
+    """
+    if fs <= 0:
+        raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
+
+    phase = np.asarray(data, dtype=np.float64)
+    if phase.ndim != 1:
+        raise ValueError(f"data must be 1D array, got shape {phase.shape}")
+
+    return np.diff(phase, prepend=prepend) * fs / (2.0*np.pi)
+
+
+def convert_frequency_to_detrended_phase_in_time(
+    data: npt.NDArray[np.float64],
+    fs: float
+) -> npt.NDArray[np.float64]:
+    """Convert frequency to phase and remove a linear phase trend.
+
+    The mean frequency is removed before integration so the resulting phase is
+    dominated by residual fluctuations. A final linear detrend removes numerical
+    or low-order drift before plotting or comparing residual phase time series.
+    """
+    freq = np.asarray(data, dtype=np.float64)
+    if freq.ndim != 1:
+        raise ValueError(f"data must be 1D array, got shape {freq.shape}")
+    if len(freq) == 0:
+        return np.array([], dtype=np.float64)
+
+    phase = convert_frequency_to_phase_in_time(freq - np.mean(freq), fs)
+    if len(phase) < 2:
+        return phase - np.mean(phase)
+    return signal.detrend(phase, type='linear')
 
 def convert_frequency_to_phase_in_asd(
     fourier_freq: npt.NDArray[np.float64],

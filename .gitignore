@@ -83,3 +83,6 @@ Network Trash Folder
 Temporary Items
 .apdisk
 *.icloud
+
+### Editors (local) ###
+.cursor/

@@ -49,6 +49,10 @@ Public API:
 """
 
 from synctools.synchronization import sync_signals, sync_multiple_twosignals
+from synctools.auxiliary import (
+    convert_frequency_to_detrended_phase_in_time,
+    convert_phase_to_frequency_in_time,
+)
 from synctools.frequency import FrequencyData
 from synctools.timer import TimerData
 from synctools.clock import Clock
@@ -58,6 +62,8 @@ from synctools.signals import TwoSignals, ThreeSignals
 __all__ = [
     "sync_signals",
     "sync_multiple_twosignals",
+    "convert_frequency_to_detrended_phase_in_time",
+    "convert_phase_to_frequency_in_time",
     "FrequencyData",
     "TimerData",
     "Clock",
