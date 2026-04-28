@@ -41,7 +41,7 @@ synctools for offset recovery.
 """
 from __future__ import annotations
 
-VERSION = "1.04"
+VERSION = "1.05"
 
 import argparse
 import logging
@@ -128,6 +128,9 @@ def build_parser() -> argparse.ArgumentParser:
 
           Use only 30 s to estimate sync, skip figure generation, custom result folder:
             %(prog)s -C . --master a.csv --slave b.csv -t 30 --no-plots -o /tmp/moku-out
+
+          Explicit initial offset guess (seconds) instead of file metadata:
+            %(prog)s -C . --master a.csv --slave b.csv --init-offset -1.25e-3
 
         Column names: each device uses prefix 1_ or 2_ in the file; --master-col and
         --slave-col are the part after the prefix, e.g. 1_freq -> column 1_1_freq
@@ -221,9 +224,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override edge truncation in samples (two-sided). If omitted, uses "
         "2*|metadata offset|*fs, consistent with the library init-offset scaling.",
     )
-    g_sync.add_argument(
+    g_init = g_sync.add_mutually_exclusive_group()
+    g_init.add_argument(
         "--no-init-offset", action="store_true",
         help="Start optimization from 0 s instead of the metadata (file timestamp) offset.",
+    )
+    g_init.add_argument(
+        "--init-offset",
+        type=float,
+        metavar="SEC",
+        default=None,
+        help="Initial time-offset guess for sync optimization (seconds). "
+        "If omitted (and not --no-init-offset), uses file timestamp metadata.",
     )
 
     # --- Output ---
@@ -461,11 +473,12 @@ def _load_streams(
         fs,
     )
 
-    metadata_offset = float((mo1.date - mo2.date).total_seconds())
-    if metadata_offset < 0.0:
-        logger.debug("Metadata: master clock is ahead of slave (%.2f s).", abs(metadata_offset))
-    else:
-        logger.debug("Metadata: slave is ahead of master (%.2f s).", metadata_offset)
+    metadata_offset = float((mo2.date - mo1.date).total_seconds())
+    logger.info(
+        "Metadata offset (slave start - master start): %.6e s (%.6e samples at fs).",
+        metadata_offset,
+        metadata_offset * fs,
+    )
     if abs(metadata_offset) > 100.0:
         logger.warning(
             "File timestamp gap is very large (%.0f s). Check recording metadata.",
@@ -674,7 +687,12 @@ def _estimate_timer_offset(
     del _unsynced
 
     offset = float(sync.timer_offsets[0])
-    logger.info("Resulting offset: %.6e s (%.6e samples at fs).", offset, offset * fs)
+    logger.info(
+        "Resulting offset: %.6e s (%.6e samples at fs); correction from init: %.6e s.",
+        offset,
+        offset * fs,
+        offset - init_offset,
+    )
     return offset
 
 
@@ -936,7 +954,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         logger.info("Edge truncation: n_truncate=%d (auto was %d)", n_truncate, n_auto)
 
-        init_offset = 0.0 if args.no_init_offset else streams.metadata_offset
+        if args.init_offset is not None:
+            init_offset = float(args.init_offset)
+        elif args.no_init_offset:
+            init_offset = 0.0
+        else:
+            init_offset = streams.metadata_offset
         offset = _estimate_timer_offset(
             in1,
             in2,
