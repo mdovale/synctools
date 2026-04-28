@@ -86,7 +86,8 @@ class PlotSettings:
     figsize: Tuple[float, float]
     dpi: int
     fontsize: float
-    linewidth: float
+    linewidth_time: float
+    linewidth_spectrum: float
     enabled: bool
 
 
@@ -139,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mokusync",
         description="Synchronize two Moku phasemeter streams (see synctools sync_signals) "
-        "and write combined CSV, optional PDF diagnostics.",
+        "and write combined CSV, optional PNG diagnostics.",
         epilog=epilog,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -242,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     g_out = p.add_argument_group("output")
     g_out.add_argument(
         "-o", "--output-dir", type=str, default="./results", metavar="DIR",
-        help="Directory for the CSV and any PDFs.",
+        help="Directory for the CSV and any PNG figures.",
     )
     g_out.add_argument(
         "--output-file", type=str, default="synced-data.csv", metavar="NAME",
@@ -250,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # --- Plots ---
-    g_plot = p.add_argument_group("plotting (matplotlib, optional PDFs)")
+    g_plot = p.add_argument_group("plotting (matplotlib, optional PNGs)")
     g_plot.add_argument(
         "--no-plots", action="store_true",
         help="Do not create time-domain or spectrum figures.",
@@ -266,8 +267,14 @@ def build_parser() -> argparse.ArgumentParser:
     g_plot.add_argument("--dpi", type=int, default=300, help="Figure resolution (dots per inch).")
     g_plot.add_argument("--fontsize", type=float, default=8, help="Axis and legend font size.")
     g_plot.add_argument(
-        "--linewidth", type=float, default=1.5,
-        help="Line width in spectrum and time series plots.",
+        "--linewidth-time", type=float, default=0.75,
+        dest="linewidth_time",
+        help="Line width in time series plots.",
+    )
+    g_plot.add_argument(
+        "--linewidth-spectrum", type=float, default=1.0,
+        dest="linewidth_spectrum",
+        help="Line width in spectrum (ASD) plots.",
     )
 
     # --- speckit / LPSD ---
@@ -392,7 +399,8 @@ def _build_plot_settings(args: argparse.Namespace) -> PlotSettings:
         figsize=(float(args.figsize[0]), float(args.figsize[1])),
         dpi=int(args.dpi),
         fontsize=float(args.fontsize),
-        linewidth=float(args.linewidth),
+        linewidth_time=float(args.linewidth_time),
+        linewidth_spectrum=float(args.linewidth_spectrum),
         enabled=not bool(args.no_plots),
     )
 
@@ -784,7 +792,7 @@ def _write_output_csv(
         df.to_csv(fh, index=False)
 
 
-def _plot_pdfs(
+def _plot_pngs(
     resdir: str,
     df: pd.DataFrame,
     fs: float,
@@ -793,13 +801,26 @@ def _plot_pdfs(
     figsize: Tuple[float, float],
     dpi: int,
     fontsize: float,
-    linewidth: float,
+    linewidth_time: float,
+    linewidth_spectrum: float,
 ) -> None:
     # Time series
     logger.debug("Plotting time series...")
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.plot(df["time"], df["freq_unsynced"], linewidth=linewidth, label=r"Unsynced", color="gray")
-    ax.plot(df["time"], df["freq_synced"], linewidth=linewidth, label=r"Synced", color="tomato")
+    ax.plot(
+        df["time"],
+        df["freq_unsynced"],
+        linewidth=linewidth_time,
+        label=r"Unsynced",
+        color="gray",
+    )
+    ax.plot(
+        df["time"],
+        df["freq_synced"],
+        linewidth=linewidth_time,
+        label=r"Synced",
+        color="tomato",
+    )
     ax.set_xlabel("Time (s)", fontsize=fontsize)
     ax.set_ylabel("Frequency (Hz)", fontsize=fontsize)
     ax.set_title(title, fontsize=fontsize)
@@ -815,13 +836,25 @@ def _plot_pdfs(
         handlelength=2.5,
     )
     fig.tight_layout()
-    fpath = os.path.join(resdir, "fig_freq_t.pdf")
+    fpath = os.path.join(resdir, "fig_freq_t.png")
     fig.savefig(fpath)
     logger.info("Wrote %s", fpath)
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.plot(df["time"], df["phase_unsynced"], linewidth=linewidth, label=r"Unsynced", color="gray")
-    ax.plot(df["time"], df["phase_synced"], linewidth=linewidth, label=r"Synced", color="tomato")
+    ax.plot(
+        df["time"],
+        df["phase_unsynced"],
+        linewidth=linewidth_time,
+        label=r"Unsynced",
+        color="gray",
+    )
+    ax.plot(
+        df["time"],
+        df["phase_synced"],
+        linewidth=linewidth_time,
+        label=r"Synced",
+        color="tomato",
+    )
     ax.set_xlabel("Time (s)", fontsize=fontsize)
     ax.set_ylabel("Phase (rad)", fontsize=fontsize)
     ax.set_title(title, fontsize=fontsize)
@@ -837,7 +870,7 @@ def _plot_pdfs(
         handlelength=2.5,
     )
     fig.tight_layout()
-    fpath = os.path.join(resdir, "fig_phase_t.pdf")
+    fpath = os.path.join(resdir, "fig_phase_t.png")
     fig.savefig(fpath)
     logger.info("Wrote %s", fpath)
 
@@ -858,8 +891,20 @@ def _plot_pdfs(
         return
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.loglog(freq_unsynced, asd_unsynced, linewidth=linewidth, label=r"Unsynced", color="gray")
-    ax.loglog(freq_synced, asd_synced, linewidth=linewidth, label=r"Synced", color="tomato")
+    ax.loglog(
+        freq_unsynced,
+        asd_unsynced,
+        linewidth=linewidth_spectrum,
+        label=r"Unsynced",
+        color="gray",
+    )
+    ax.loglog(
+        freq_synced,
+        asd_synced,
+        linewidth=linewidth_spectrum,
+        label=r"Synced",
+        color="tomato",
+    )
     ax.set_xlim(freq_synced[0], freq_synced[-1])
     ax.set_xlabel("Fourier frequency (Hz)", fontsize=fontsize)
     ax.set_ylabel(r"Frequency ASD $\rm (Hz/Hz^{1/2})$", fontsize=fontsize)
@@ -876,7 +921,7 @@ def _plot_pdfs(
         handlelength=2.5,
     )
     fig.tight_layout()
-    fpath = os.path.join(resdir, "fig_freq_asd.pdf")
+    fpath = os.path.join(resdir, "fig_freq_asd.png")
     fig.savefig(fpath)
     logger.info("Wrote %s", fpath)
 
@@ -884,14 +929,14 @@ def _plot_pdfs(
     ax.loglog(
         freq_unsynced,
         convert_frequency_to_phase_in_asd(freq_unsynced, asd_unsynced),
-        linewidth=linewidth,
+        linewidth=linewidth_spectrum,
         label=r"Unsynced",
         color="gray",
     )
     ax.loglog(
         freq_synced,
         convert_frequency_to_phase_in_asd(freq_synced, asd_synced),
-        linewidth=linewidth,
+        linewidth=linewidth_spectrum,
         label=r"Synced",
         color="tomato",
     )
@@ -911,7 +956,7 @@ def _plot_pdfs(
         handlelength=2.5,
     )
     fig.tight_layout()
-    fpath = os.path.join(resdir, "fig_phase_asd.pdf")
+    fpath = os.path.join(resdir, "fig_phase_asd.png")
     fig.savefig(fpath)
     logger.info("Wrote %s", fpath)
     plt.close("all")
@@ -991,7 +1036,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _write_output_csv(output_path, df, header_lines)
 
         if plot_settings.enabled:
-            _plot_pdfs(
+            _plot_pngs(
                 resdir,
                 df,
                 streams.fs,
@@ -1000,7 +1045,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 plot_settings.figsize,
                 plot_settings.dpi,
                 plot_settings.fontsize,
-                plot_settings.linewidth,
+                plot_settings.linewidth_time,
+                plot_settings.linewidth_spectrum,
             )
         else:
             logger.info("Skipping plots (--no-plots).")
