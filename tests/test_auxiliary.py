@@ -3,15 +3,20 @@ Unit tests for auxiliary.py helper functions.
 """
 import numpy as np
 import pytest
+
 from synctools.auxiliary import (
-    spectra,
-    integral_rms,
-    model_timer_deviation_error,
+    build_kaiser_lpf_taps,
+    combination_2sig,
+    combination_3sig,
     convert_frequency_to_detrended_phase_in_time,
+    convert_frequency_to_phase_in_asd,
     convert_frequency_to_phase_in_time,
     convert_phase_to_frequency_in_time,
-    convert_frequency_to_phase_in_asd,
     crop_data,
+    get_asd_delay_factor,
+    integral_rms,
+    model_timer_deviation_error,
+    spectra,
 )
 
 
@@ -124,6 +129,23 @@ class TestIntegralRMS:
         
         # Should match within reasonable tolerance
         assert abs(rms - expected_rms) < 0.1 * expected_rms
+
+    def test_integral_rms_no_overlap(self):
+        """Pass bands outside the spectrum should integrate to zero."""
+        fourier_freq = np.linspace(0.01, 1.0, 100)
+        asd = np.ones_like(fourier_freq)
+
+        rms = integral_rms(fourier_freq, asd, pass_band=[2.0, 3.0])
+
+        assert rms == 0.0
+
+    def test_integral_rms_invalid_passband(self):
+        """Invalid pass-band bounds should raise a clear validation error."""
+        fourier_freq = np.linspace(0.01, 1.0, 100)
+        asd = np.ones_like(fourier_freq)
+
+        with pytest.raises(ValueError, match="pass_band min must be <= max"):
+            integral_rms(fourier_freq, asd, pass_band=[1.0, 0.1])
 
 
 class TestModelTimerDeviationError:
@@ -243,6 +265,50 @@ class TestConvertFrequencyToPhase:
         
         with pytest.raises(ValueError, match="must have same length"):
             convert_frequency_to_phase_in_asd(fourier_freq, freq_asd)
+
+
+class TestSignalCombinations:
+    """Tests for two- and three-signal combination helpers."""
+
+    def test_combination_2sig_accepts_array_like_signs(self):
+        """Array-like signs should work without mutable default arrays."""
+        freqs = np.array([[1.0, 2.0], [3.0, 4.0]])
+        weights = np.ones_like(freqs)
+
+        output = combination_2sig(freqs, weights, signs=[1, -1])
+
+        assert np.allclose(output, [-1.0, -1.0])
+
+    def test_combination_3sig_rejects_invalid_sign_values(self):
+        """Signs must be explicit +/-1 values."""
+        freqs = np.ones((2, 3))
+        weights = np.ones_like(freqs)
+
+        with pytest.raises(ValueError, match="signs must contain only -1 or \\+1"):
+            combination_3sig(freqs, weights, signs=[1, 0, -1])
+
+    def test_combination_rejects_1d_input(self):
+        """Invalid frequency shapes should raise ValueError instead of IndexError."""
+        with pytest.raises(ValueError, match="freqs must have shape"):
+            combination_2sig(np.array([1.0, 2.0]), np.ones((1, 2)))
+
+
+class TestFilterAndDelayHelpers:
+    """Tests for filter design and delay-factor helpers."""
+
+    def test_build_kaiser_lpf_taps_validates_band(self):
+        """Invalid transition bands should fail before scipy receives them."""
+        with pytest.raises(ValueError, match="0 <= f_pass < f_stop < fs / 2"):
+            build_kaiser_lpf_taps(fs=1.0, f_pass=0.4, f_stop=0.6)
+
+    def test_get_asd_delay_factor_uses_stable_small_delay_math(self):
+        """Very small delays should still produce finite delay factors."""
+        fourier_freq = np.array([0.0, 1e-6, 1e-3])
+
+        factor = get_asd_delay_factor(fourier_freq, delay=1e-9)
+
+        assert np.all(np.isfinite(factor))
+        assert factor[0] == 0.0
 
 
 class TestCropData:
