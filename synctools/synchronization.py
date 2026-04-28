@@ -46,10 +46,12 @@ from synctools.auxiliary import (
     build_kaiser_lpf_taps,
     combination_2sig,
     combination_3sig,
+    convert_frequency_to_phase_in_asd,
     convert_frequency_to_phase_in_time,
     get_asd_delay_factor,
     integral_rms,
     spectra,
+    validate_lpsd_params,
 )
 from synctools.clock import Clock
 from synctools.frequency import FrequencyData
@@ -347,6 +349,7 @@ class Synchronization:
             >>> print(f"Time offsets: {sync.timer_offsets} s")
         """
         fs = _validate_positive_float(fs, "fs")
+        validate_lpsd_params(p_lpsd)
         _validate_model_and_domain(model, domain)
         interp_order = _validate_positive_int(interp_order, "interp_order")
         n_trunc = _validate_non_negative_int(n_trunc, "n_trunc")
@@ -775,7 +778,28 @@ class Synchronization:
             
             try:
                 frfr, freq_output_asd = spectra(freq_output_t, self.fs, p_lpsd=self.p_lpsd)
-                frfr, phase_output_asd = spectra(phase_output_t, self.fs, p_lpsd=self.p_lpsd)
+                if frfr.size == 0 or freq_output_asd.size == 0:
+                    empty_asd = np.array([])
+                    empty_frfr = np.array([])
+                    freq = {"time": freq_output_t, "asd": empty_asd}
+                    phase = {"time": phase_output_t, "asd": empty_asd}
+                    return empty_frfr, freq, phase
+                # Derive phase ASD from frequency ASD (single LPSD call); matches
+                # TwoSignalsElement.compute_all_spectrum pattern.
+                try:
+                    if np.any(frfr <= 0):
+                        raise ValueError("non-positive Fourier frequency bin")
+                    phase_output_asd = convert_frequency_to_phase_in_asd(
+                        frfr, freq_output_asd
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Deriving phase ASD from frequency ASD failed; "
+                        "falling back to a second spectral estimate on phase time series."
+                    )
+                    _, phase_output_asd = spectra(
+                        phase_output_t, self.fs, p_lpsd=self.p_lpsd
+                    )
                 freq = {"time": freq_output_t, "asd": freq_output_asd}
                 phase = {"time": phase_output_t, "asd": phase_output_asd}
             except (ZeroDivisionError, ValueError) as e:
@@ -1033,6 +1057,7 @@ def sync_signals(
         >>> print(f"Time offset: {synced.timer_offsets[0]:.6f} s")
     """
     fs = _validate_positive_float(fs, "fs")
+    validate_lpsd_params(p_lpsd)
     in_signals_arrays = _as_signal_arrays(in_signals, min_count=2, max_count=3)
     first_len = len(in_signals_arrays[0])
     _validate_model_and_domain(model, domain)
@@ -1277,6 +1302,7 @@ def sync_multiple_twosignals(
         >>> print(f"Time offset A-D: {results[2][1].timer_offsets[0]:.6f} s")
     """
     fs = _validate_positive_float(fs, "fs")
+    validate_lpsd_params(p_lpsd)
     in_signals_arrays = _as_signal_arrays(in_signals, min_count=2)
     first_len = len(in_signals_arrays[0])
     _validate_model_and_domain(model, domain)

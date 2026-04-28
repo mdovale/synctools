@@ -66,9 +66,25 @@ __all__ = [
     "integral_rms",
     "model_timer_deviation_error",
     "spectra",
+    "validate_lpsd_params",
 ]
 
 _REQUIRED_LPSD_KEYS = ("olap", "bmin", "Lmin", "Jdes", "Kdes", "order", "win", "psll")
+
+
+def validate_lpsd_params(p_lpsd: Dict[str, Any]) -> None:
+    """Ensure ``p_lpsd`` contains all keys required by :func:`spectra`.
+
+    Call this from public entrypoints before heavy setup so misconfigured
+    SpecKit parameters fail fast with the same error shape as :func:`spectra`.
+
+    Raises:
+        ValueError: If ``p_lpsd`` is missing required keys.
+        TypeError: If ``p_lpsd`` is not mapping-like enough to support ``in``.
+    """
+    missing_keys = [key for key in _REQUIRED_LPSD_KEYS if key not in p_lpsd]
+    if missing_keys:
+        raise ValueError(f"p_lpsd is missing required keys: {missing_keys}")
 _DEFAULT_2SIG_SIGNS = (1, -1)
 _DEFAULT_3SIG_SIGNS = (1, 1, -1)
 
@@ -145,9 +161,7 @@ def spectra(
         - asd: Amplitude spectral density array (same units as input / √Hz)
     """
     sampling_rate = _validate_positive_float(fs, "Sampling rate fs")
-    missing_keys = [key for key in _REQUIRED_LPSD_KEYS if key not in p_lpsd]
-    if missing_keys:
-        raise ValueError(f"p_lpsd is missing required keys: {missing_keys}")
+    validate_lpsd_params(p_lpsd)
 
     time_series = _as_1d_float_array(data, "data")
     data_len = time_series.size

@@ -60,14 +60,30 @@ def linear_drift_signal(sample_time_array):
 
 
 @pytest.fixture
-def synthetic_frequency_data(sample_time_array, sample_fs):
-    """Create synthetic frequency data with known characteristics."""
+def synthetic_frequency_data(sample_time_array, sample_fs, fixed_seed):
+    """Create synthetic frequency data with known characteristics (deterministic)."""
     n_samples = len(sample_time_array)
+    np.random.seed(fixed_seed)
     # Constant frequency with small white noise
     base_freq = 1e6  # Hz
     noise_level = 1.0  # Hz
     noise = noise_level * np.random.randn(n_samples)
     return base_freq + noise
+
+
+@pytest.fixture
+def fast_lpsd_params():
+    """Cheaper SpecKit parameters for smoke tests (smaller spectral workload)."""
+    return {
+        "olap": "default",
+        "bmin": 1.0,
+        "Lmin": 1,
+        "Jdes": 32,
+        "Kdes": 128,
+        "order": 0,
+        "win": "Kaiser",
+        "psll": 200.0,
+    }
 
 
 def generate_synthetic_signal_with_offset(

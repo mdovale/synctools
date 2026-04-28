@@ -17,7 +17,19 @@ from synctools.auxiliary import (
     integral_rms,
     model_timer_deviation_error,
     spectra,
+    validate_lpsd_params,
 )
+
+
+class TestValidateLpsdParams:
+    """Tests for validate_lpsd_params (early validation shared with spectra)."""
+
+    def test_validate_lpsd_params_accepts_full_dict(self, default_lpsd_params):
+        validate_lpsd_params(default_lpsd_params)
+
+    def test_validate_lpsd_params_missing_keys(self):
+        with pytest.raises(ValueError, match="p_lpsd is missing required keys"):
+            validate_lpsd_params({"olap": "default"})
 
 
 class TestSpectra:

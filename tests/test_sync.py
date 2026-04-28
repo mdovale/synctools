@@ -1,9 +1,20 @@
 """
 Integration tests for sync_signals function.
 """
+from functools import partial
+from unittest.mock import patch
+
 import numpy as np
 import pytest
-from synctools.synchronization import sync_signals
+
+from synctools.auxiliary import combination_2sig, spectra as spectra_impl
+from synctools.frequency import FrequencyData
+from synctools.signals import TwoSignals
+from synctools.synchronization import (
+    Synchronization,
+    sync_multiple_twosignals,
+    sync_signals,
+)
 from speckit.dsp import timeshift
 
 
@@ -380,3 +391,100 @@ class TestSyncMultipleTwoSignals:
                 default_lpsd_params,
                 init_offsets=[[0.0]]  # Wrong length, should be 2
             )
+
+
+class TestProductionReadinessSync:
+    """Early validation, spectral efficiency, and clock_refs coverage."""
+
+    def test_sync_signals_rejects_incomplete_p_lpsd_before_processing(self):
+        signal = np.ones(80)
+        bad_plpsd = {"olap": "default"}
+        with pytest.raises(ValueError, match="p_lpsd is missing required keys"):
+            sync_signals([signal, signal], 10.0, bad_plpsd)
+
+    def test_sync_multiple_twosignals_rejects_incomplete_p_lpsd_early(self):
+        signal = np.ones(80)
+        bad_plpsd = {"olap": "default"}
+        with pytest.raises(ValueError, match="p_lpsd is missing required keys"):
+            sync_multiple_twosignals([signal, signal, signal], 10.0, bad_plpsd)
+
+    def test_compute_tdir_output_calls_spectra_once(self, default_lpsd_params):
+        """Regression: phase ASD is derived from frequency ASD (one LPSD pass)."""
+        n = 400
+        fs = 10.0
+        fd1 = FrequencyData(1e6 * np.ones(n), fs)
+        fd2 = FrequencyData(1e6 * np.ones(n), fs)
+        unsynced = TwoSignals([fd1, fd2], default_lpsd_params)
+        sync = Synchronization(
+            partial(combination_2sig),
+            unsynced,
+            fs,
+            default_lpsd_params,
+            model="total",
+            domain="freq",
+            method="Nelder-Mead",
+            n_trunc=0,
+            name="unit-test",
+        )
+        sync.weights = np.ones(2, dtype=np.float64)
+        ccs = np.column_stack([fd1.total, fd2.total])
+
+        calls = []
+
+        def counting_spectra(*args, **kwargs):
+            calls.append(1)
+            return spectra_impl(*args, **kwargs)
+
+        with patch("synctools.synchronization.spectra", side_effect=counting_spectra):
+            frfr, freq, phase = sync.compute_TDIR_output(ccs, skip_asd_computation=False)
+
+        assert len(calls) == 1
+        assert frfr is not None and len(frfr) > 0
+        assert freq["asd"] is not None and len(freq["asd"]) == len(frfr)
+        assert phase["asd"] is not None and len(phase["asd"]) == len(frfr)
+
+    def test_sync_signals_accepts_clock_refs(self, default_lpsd_params, fixed_seed):
+        np.random.seed(fixed_seed)
+        n_samples = 120
+        fs = 10.0
+        signal1 = 1e6 * np.ones(n_samples)
+        signal2 = 1e6 * np.ones(n_samples)
+        clock_ref = np.zeros(n_samples)
+
+        _unsynced, synced = sync_signals(
+            [signal1, signal2],
+            fs,
+            default_lpsd_params,
+            init_offsets=[0.0],
+            model="fluc",
+            domain="time",
+            method="Nelder-Mead",
+            clock_refs=[clock_ref],
+            n_truncate=10,
+        )
+        assert synced.timer_offsets is not None
+        assert len(synced.timer_offsets) == 1
+
+    def test_sync_multiple_twosignals_accepts_clock_refs(self, fast_lpsd_params, fixed_seed):
+        np.random.seed(fixed_seed)
+        n_samples = 80
+        fs = 10.0
+        signal_a = 1e6 * np.ones(n_samples)
+        signal_b = 1e6 * np.ones(n_samples)
+        signal_c = 1e6 * np.ones(n_samples)
+
+        results = sync_multiple_twosignals(
+            [signal_a, signal_b, signal_c],
+            fs,
+            fast_lpsd_params,
+            init_offsets=None,
+            clock_refs=[np.zeros(n_samples), None],
+            model="fluc",
+            domain="time",
+            method="Nelder-Mead",
+            n_truncate=5,
+        )
+        assert len(results) == 2
+        for _unsynced, synced in results:
+            assert synced.timer_offsets is not None
+            assert len(synced.timer_offsets) == 1
