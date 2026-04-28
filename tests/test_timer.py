@@ -41,6 +41,9 @@ class TestTimerDataBasic:
         
         with pytest.raises(ValueError, match="sign must be -1 or \\+1"):
             TimerData(fd, sample_fs, sign=2)
+
+        with pytest.raises(ValueError, match="sign must be -1 or \\+1"):
+            TimerData(fd, sample_fs, sign=True)
     
     def test_timer_data_sign(self, sample_fs):
         """Test that sign parameter flips the timer."""
@@ -215,6 +218,8 @@ class TestTimerDataTruncation:
         assert len(td.fit['inv']) == len(td.tau)
         assert len(td.fluc['raw']) == len(td.tau)
         assert len(td.fluc['inv']) == len(td.tau)
+        assert len(td.timer_dev_err['estimate']) == len(td.tau)
+        assert len(td.timer_dev_err['model']) == len(td.tau)
 
     def test_zero_truncation_is_noop(self, sample_fs):
         """Zero truncation should preserve timer arrays."""
@@ -261,6 +266,22 @@ class TestTimerDataErrorComputation:
         assert 'model' in td.timer_dev_err
         assert len(td.timer_dev_err['estimate']) == n_samples
         assert len(td.timer_dev_err['model']) == n_samples
+
+    def test_compute_timer_deviation_error_does_not_mutate_fit_model(self, sample_fs):
+        """Timer deviation error recomputation should be idempotent."""
+        n_samples = 1000
+        t = np.arange(n_samples) / sample_fs
+        frac_freq = 1e-12 * t
+        fd = FrequencyData(frac_freq, sample_fs, order=1)
+        td = TimerData(fd, sample_fs, skip_error_computation=True)
+        original_p_fit_model = td.p_fit_model.copy()
+
+        td.compute_timer_deviation_error(sample_fs)
+        first_model = td.timer_dev_err['model'].copy()
+        td.compute_timer_deviation_error(sample_fs)
+
+        assert np.allclose(td.p_fit_model, original_p_fit_model)
+        assert np.allclose(td.timer_dev_err['model'], first_model)
     
     def test_compute_timer_deviation_error_validation(self, sample_fs):
         """Test timer deviation error validation."""

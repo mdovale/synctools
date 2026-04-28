@@ -33,244 +33,322 @@
 # export authority as may be required before exporting such information to
 # foreign countries or providing access to foreign persons.
 #
-import copy
+from typing import TYPE_CHECKING, Dict, Tuple
+
 import numpy as np
 import numpy.typing as npt
-from typing import TYPE_CHECKING, Tuple, Dict
 from pytdi.dsp import calculate_advancements
-import logging
-logger = logging.getLogger(__name__)
 
 from synctools.auxiliary import model_timer_deviation_error
 
 if TYPE_CHECKING:
     from synctools.frequency import FrequencyData
 
+
+def _as_1d_float_array(
+    values: npt.ArrayLike,
+    name: str,
+    *,
+    copy_array: bool = False,
+) -> npt.NDArray[np.float64]:
+    """Return finite 1D data as ``float64``."""
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be 1D array, got shape {array.shape}")
+    if array.size == 0:
+        raise ValueError(f"{name} cannot be empty")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values")
+    if copy_array:
+        array = array.copy()
+    return array
+
+
+def _validate_finite_float(value: float, name: str) -> float:
+    """Coerce a numeric scalar to finite ``float``."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite numeric scalar, got {value!r}") from exc
+    if not np.isfinite(result):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return result
+
+
+def _validate_sampling_rate(fs: float) -> float:
+    result = _validate_finite_float(fs, "fs")
+    if result <= 0:
+        raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
+    return result
+
+
+def _validate_positive_float(value: float, name: str) -> float:
+    result = _validate_finite_float(value, name)
+    if result <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}")
+    return result
+
+
+def _validate_non_negative_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return result
+
+
+def _validate_positive_int(value: int, name: str) -> int:
+    result = _validate_non_negative_int(value, name)
+    if result <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return result
+
+
+def _validate_sign(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"sign must be -1 or +1, got {value!r}")
+    sign = int(value)
+    if sign not in (-1, 1):
+        raise ValueError(f"sign must be -1 or +1, got {value}")
+    return sign
+
+
 class TimerData:
-	def __init__(
-		self,
-		rd: 'FrequencyData',
-		fs: float,
-		sign: int = -1,
-		offset: float = 0.0,
-		skip_error_computation: bool = False
-	) -> None:
-		"""Class for timer data (integrated clock signal).
-		
-		This class converts fractional frequency data to timer data through integration,
-		providing both "raw" (direct integration) and "inv" (inverse/advancement) forms.
-		
-		Args:
-			rd: The underlying FrequencyData instance containing fractional frequency.
-			    - rd.total: Total fractional frequency, shape (n_samples,)
-			    - Units: dimensionless (fractional frequency)
-			    - Typically represents clock jitter or differential clock frequency
-			fs: Data rate (sampling frequency).
-			   - Units: Hz
-			   - Must be > 0
-			sign: Sign multiplier for frequency-to-time conversion.
-			     - Must be -1 or +1
-			     - If -1, flips the sign of input frequency before integration
-			     - Convention: -1 typically used for timer sign against frequency
-			offset: Initial timer offset.
-			       - Units: seconds
-			       - Added to the integrated timer signal
-			skip_error_computation: If True, skip computation of timer deviation error.
-			                       - Set to True for faster initialization when error
-			                         will be computed later
-        
-		Attributes (after initialization):
-			tau: Time array.
-			     - Shape: (n_samples,)
-			     - Units: seconds
-			     - Same as rd.tau
-			total: Dictionary containing timer data.
-			       - total['raw']: Raw timer (direct integration), shape (n_samples,), units: s
-			       - total['inv']: Inverse timer (advancement), shape (n_samples,), units: s
-			fit: Dictionary containing fitted (deterministic) timer components.
-			     - fit['raw']: Fitted raw timer, shape (n_samples,), units: s
-			     - fit['inv']: Fitted inverse timer, shape (n_samples,), units: s
-			     - Polynomial fit order is rd.order + 1
-			fluc: Dictionary containing fluctuation (stochastic) timer components.
-			      - fluc['raw']: Fluctuation raw timer, shape (n_samples,), units: s
-			      - fluc['inv']: Fluctuation inverse timer, shape (n_samples,), units: s
-			p_fit_model: Polynomial coefficients for timer deviation error model.
-			             - Shape: (rd.order + 2,)
-			             - Used for modeling timer deviation error
-			timer_dev_err: Dictionary containing timer deviation error (if computed).
-			               - timer_dev_err['estimate']: Estimated error, shape (n_samples,), units: s
-			               - timer_dev_err['model']: Modeled error, shape (n_samples,), units: s
-			               - Only set if skip_error_computation=False
-        
-		Raises:
-			ValueError: If fs <= 0 or sign is not -1 or +1.
-		
-		Example:
-			>>> import numpy as np
-			>>> from synctools import TimerData, FrequencyData
-			>>> rd = FrequencyData(np.ones(1000) * 1e-9, fs=10.0)  # 1 ppb fractional freq
-			>>> timer = TimerData(rd, fs=10.0, sign=-1, offset=0.0)
-			>>> print(f"Timer range: {timer.total['raw'].min():.2e} to {timer.total['raw'].max():.2e} s")
-		"""
-		if fs <= 0:
-			raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-		if sign not in (-1, 1):
-			raise ValueError(f"sign must be -1 or +1, got {sign}")
-		
-		_rd = copy.deepcopy(rd)
-		self.tau = _rd.tau
+    def __init__(
+        self,
+        rd: "FrequencyData",
+        fs: float,
+        sign: int = -1,
+        offset: float = 0.0,
+        skip_error_computation: bool = False,
+    ) -> None:
+        """Class for timer data (integrated clock signal).
 
-		# : === create timers ================
-		# : raw timers
-		total = self.convert_frac_frequency_to_time(sign*_rd.total, fs) + offset
-		fit = self.convert_frac_frequency_to_time(sign*_rd.fit, fs) + offset
-		fluc = self.convert_frac_frequency_to_time(sign*_rd.fluc, fs)
-		# : inverse timers
-		order = _rd.order + 1 # + 1 is because timer is the integral of frac. freq
-		total_inv = calculate_advancements(total, fs)
-		fit_inv, p_fit_inv = self.fit_timer(self.tau, total_inv, order)
-		fluc_inv = total_inv - fit_inv
-		# : packaging
-		self.total = {"raw": total, "inv": total_inv}
-		self.fit = {"raw": fit, "inv": fit_inv}
-		self.fluc = {"raw": fluc, "inv": fluc_inv}
+        This class converts fractional frequency data to timer data through
+        integration, providing both "raw" (direct integration) and "inv"
+        (inverse/advancement) forms.
 
-		# : === compute timer deviation error ================
-		self.p_fit_model = np.append(_rd.p_fit, 0.0)
-		if not skip_error_computation:
-			self.compute_timer_deviation_error(fs)
+        Args:
+            rd: FrequencyData instance containing fractional frequency.
+                ``rd.total``, ``rd.fit``, ``rd.fluc``, and ``rd.tau`` must be
+                finite 1D arrays with matching lengths.
+            fs: Data rate (sampling frequency), in Hz. Must be finite and > 0.
+            sign: Sign multiplier for frequency-to-time conversion. Must be
+                exactly -1 or +1.
+            offset: Initial timer offset, in seconds.
+            skip_error_computation: If True, skip computation of timer deviation
+                error for faster initialization.
 
-	def compute_timer_deviation_error(self, fs: float) -> None:
-		"""Compute the error of non-inverted timer deviation.
-		
-		Args:
-			fs: Data rate (Hz). Must be > 0.
-		"""
-		if fs <= 0:
-			raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-		
-		p_fit_model_tmp = self.p_fit_model # do not update self.p_fit_model itself
-		# : estimate (use inverse_timer_wo_large_offset, instead of self.total["inv"])
-		total_inv = self.inverse_timer_wo_large_offset(self.total["raw"], fs)
-		timer_dev_err_estimate = total_inv - self.total["raw"]
-		# : model
-		for i in range(p_fit_model_tmp.shape[0] - 1):
-			scale = (p_fit_model_tmp.shape[0]-1) - i
-			p_fit_model_tmp[i] /= scale
-		timer_dev_err_model = model_timer_deviation_error(p_fit_model_tmp, self.tau)
-		# : packaging
-		self.timer_dev_err = {"estimate": timer_dev_err_estimate, "model":timer_dev_err_model}
+        Attributes:
+            tau: Time array copied from ``rd.tau``.
+            total: Raw and inverse timer data, keyed by ``"raw"`` and ``"inv"``.
+            fit: Fitted deterministic timer components.
+            fluc: Stochastic timer components.
+            p_fit_model: Frequency-fit coefficients padded with a zero constant
+                term for timer deviation error modeling.
+            timer_dev_err: Timer deviation error dictionary, set only when
+                ``skip_error_computation`` is False or when
+                ``compute_timer_deviation_error()`` is called explicitly.
 
-	def fit_timer(
-		self,
-		tau: npt.NDArray[np.float64],
-		data: npt.NDArray[np.float64],
-		order: int = 0
-	) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-		"""Polynomial fit for timer.
-		
-		Args:
-			tau: Time array (s)
-			data: Timer data array to detrend (s)
-			order: Detrend order (non-negative integer)
-		
-		Returns:
-			Tuple of (data_fit, p_fit) where:
-			- data_fit: Fitted timer data (s)
-			- p_fit: Polynomial coefficients
-		"""
-		if order < 0:
-			raise ValueError(f"order must be non-negative, got {order}")
-		if len(tau) != len(data):
-			raise ValueError(
-				f"tau and data must have same length ({len(tau)} vs {len(data)})"
-			)
-		
-		p_fit = np.polyfit(tau, data, deg=order)
-		data_fit = np.polyval(p_fit, tau)
-		return data_fit, p_fit
+        Raises:
+            ValueError: If inputs are not finite, 1D, length-compatible, or if
+                ``fs``/``sign``/``offset`` are invalid.
+        """
+        fs = _validate_sampling_rate(fs)
+        sign = _validate_sign(sign)
+        offset = _validate_finite_float(offset, "offset")
 
-	def convert_frac_frequency_to_time(
-		self,
-		data: npt.NDArray[np.float64],
-		fs: float,
-		zeroed: bool = False
-	) -> npt.NDArray[np.float64]:
-		"""Convert fractional frequency to time by integration.
-		
-		Args:
-			data: Fractional frequency data to be converted to time (dimensionless)
-			fs: Data rate (Hz). Must be > 0.
-			zeroed: If True, anchor initial value to zero.
-		
-		Returns:
-			Timer data array (s)
-		"""
-		if fs <= 0:
-			raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-		
-		dt = 1.0/fs
-		timer = dt*np.cumsum(data)
-		if zeroed:
-			timer -= timer[0]
+        tau = _as_1d_float_array(rd.tau, "rd.tau", copy_array=True)
+        total_freq = _as_1d_float_array(rd.total, "rd.total")
+        fit_freq = _as_1d_float_array(rd.fit, "rd.fit")
+        fluc_freq = _as_1d_float_array(rd.fluc, "rd.fluc")
+        order = _validate_non_negative_int(rd.order, "rd.order")
+        p_fit = _as_1d_float_array(rd.p_fit, "rd.p_fit")
 
-		return timer
+        data_len = tau.size
+        for name, values in (
+            ("rd.total", total_freq),
+            ("rd.fit", fit_freq),
+            ("rd.fluc", fluc_freq),
+        ):
+            if values.size != data_len:
+                raise ValueError(
+                    f"{name} must have same length as rd.tau ({values.size} vs {data_len})"
+                )
+        if p_fit.size != order + 1:
+            raise ValueError(
+                f"rd.p_fit length must equal rd.order + 1 ({p_fit.size} vs {order + 1})"
+            )
 
-	def inverse_timer_wo_large_offset(
-		self,
-		data: npt.NDArray[np.float64],
-		fs: float,
-		interp_order: int = 5,
-		delta: float = 1e-12,
-		maxiter: int = 100
-	) -> npt.NDArray[np.float64]:
-		"""Inverse timer deviation without a large initial offset for advancements.
-		
-		To be compared with model_timer_deviation_error(), which simulates only 
-		deterministic components.
-		
-		Args:
-			data: Timer data to be inverted (s)
-			fs: Data rate (Hz). Must be > 0.
-			interp_order: Interpolation order (positive integer)
-			delta: Error threshold of the numerical derivation
-			maxiter: Maximum number of iterations of numerical computations
-		
-		Returns:
-			Inverse timer data array (s)
-		"""
-		if fs <= 0:
-			raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-		if interp_order <= 0:
-			raise ValueError(f"interp_order must be positive, got {interp_order}")
-		if maxiter <= 0:
-			raise ValueError(f"maxiter must be positive, got {maxiter}")
-		
-		inverse = calculate_advancements(data-data[0], fs, order=interp_order, delta=delta, maxiter=maxiter)
-		inverse += data[0]
-		return inverse
+        self.fs = fs
+        self.tau = tau
 
-	def truncation(self, n_trunc: int) -> None:
-		"""Truncate both ends of time-series.
-		
-		Args:
-			n_trunc: Number of points to be truncated at each end of array.
-			        Must satisfy n_trunc < len(data) // 2.
-		"""
-		if n_trunc < 0:
-			raise ValueError(f"n_trunc must be non-negative, got {n_trunc}")
-		if n_trunc == 0:
-			return
-		data_len = len(self.tau)
-		if n_trunc >= data_len // 2:
-			raise ValueError(
-				f"n_trunc ({n_trunc}) must be < len(data) // 2 ({data_len // 2})"
-			)
-		
-		self.tau = self.tau[n_trunc:-n_trunc]
-		self.total["raw"] = self.total["raw"][n_trunc:-n_trunc]
-		self.total["inv"] = self.total["inv"][n_trunc:-n_trunc]
-		self.fit["raw"] = self.fit["raw"][n_trunc:-n_trunc]
-		self.fit["inv"] = self.fit["inv"][n_trunc:-n_trunc]
-		self.fluc["raw"] = self.fluc["raw"][n_trunc:-n_trunc]
-		self.fluc["inv"] = self.fluc["inv"][n_trunc:-n_trunc]
+        total = self.convert_frac_frequency_to_time(sign * total_freq, fs) + offset
+        fit = self.convert_frac_frequency_to_time(sign * fit_freq, fs) + offset
+        fluc = self.convert_frac_frequency_to_time(sign * fluc_freq, fs)
+
+        # Timer is the integral of fractional frequency, so the fitted inverse
+        # timer polynomial is one order higher than the source frequency fit.
+        timer_fit_order = order + 1
+        total_inv = calculate_advancements(total, fs)
+        fit_inv, self.p_fit_inv = self.fit_timer(self.tau, total_inv, timer_fit_order)
+        fluc_inv = total_inv - fit_inv
+
+        self.total: Dict[str, npt.NDArray[np.float64]] = {"raw": total, "inv": total_inv}
+        self.fit: Dict[str, npt.NDArray[np.float64]] = {"raw": fit, "inv": fit_inv}
+        self.fluc: Dict[str, npt.NDArray[np.float64]] = {"raw": fluc, "inv": fluc_inv}
+
+        self.p_fit_model = np.append(p_fit, 0.0)
+        if not skip_error_computation:
+            self.compute_timer_deviation_error(fs)
+
+    def compute_timer_deviation_error(self, fs: float) -> None:
+        """Compute the modeled and estimated non-inverted timer deviation error.
+
+        Args:
+            fs: Data rate (Hz). Must be finite and > 0.
+        """
+        fs = _validate_sampling_rate(fs)
+
+        total_raw = _as_1d_float_array(self.total["raw"], 'self.total["raw"]')
+        if total_raw.size != self.tau.size:
+            raise ValueError(
+                f"self.total['raw'] must have same length as tau "
+                f"({total_raw.size} vs {self.tau.size})"
+            )
+
+        # Use inverse_timer_wo_large_offset instead of self.total["inv"] so large
+        # initial offsets do not dominate the advancement calculation.
+        total_inv = self.inverse_timer_wo_large_offset(total_raw, fs)
+        timer_dev_err_estimate = total_inv - total_raw
+
+        p_fit_model_tmp = self.p_fit_model.copy()
+        degree = p_fit_model_tmp.size - 1
+        for index in range(degree):
+            p_fit_model_tmp[index] /= degree - index
+        timer_dev_err_model = model_timer_deviation_error(p_fit_model_tmp, self.tau)
+
+        self.timer_dev_err = {"estimate": timer_dev_err_estimate, "model": timer_dev_err_model}
+
+    @staticmethod
+    def fit_timer(
+        tau: npt.ArrayLike,
+        data: npt.ArrayLike,
+        order: int = 0,
+    ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """Fit timer data with a polynomial.
+
+        Args:
+            tau: Time array (s).
+            data: Timer data array to detrend (s).
+            order: Detrend order. Must be a non-negative integer less than the
+                number of samples.
+
+        Returns:
+            Tuple of ``(data_fit, p_fit)`` where ``data_fit`` is the fitted timer
+            data and ``p_fit`` contains NumPy polynomial coefficients.
+        """
+        tau = _as_1d_float_array(tau, "tau")
+        data = _as_1d_float_array(data, "data")
+        order = _validate_non_negative_int(order, "order")
+        if tau.size != data.size:
+            raise ValueError(f"tau and data must have same length ({tau.size} vs {data.size})")
+        if order >= data.size:
+            raise ValueError(f"order ({order}) must be less than number of samples ({data.size})")
+        if order == 0:
+            mean = float(np.mean(data, dtype=np.float64))
+            return np.full(data.shape, mean, dtype=np.float64), np.array([mean])
+
+        p_fit = np.polyfit(tau, data, deg=order)
+        data_fit = np.polyval(p_fit, tau)
+        return data_fit, p_fit
+
+    @staticmethod
+    def convert_frac_frequency_to_time(
+        data: npt.ArrayLike,
+        fs: float,
+        zeroed: bool = False,
+    ) -> npt.NDArray[np.float64]:
+        """Convert fractional frequency to time by discrete integration.
+
+        Args:
+            data: Fractional frequency data to convert to time (dimensionless).
+            fs: Data rate (Hz). Must be finite and > 0.
+            zeroed: If True, anchor the initial value to zero after integration.
+
+        Returns:
+            Timer data array (s).
+        """
+        data = _as_1d_float_array(data, "data")
+        fs = _validate_sampling_rate(fs)
+
+        timer = np.cumsum(data, dtype=np.float64) / fs
+        if zeroed:
+            timer = timer - timer[0]
+
+        return timer
+
+    @staticmethod
+    def inverse_timer_wo_large_offset(
+        data: npt.ArrayLike,
+        fs: float,
+        interp_order: int = 5,
+        delta: float = 1e-12,
+        maxiter: int = 100,
+    ) -> npt.NDArray[np.float64]:
+        """Invert timer deviation while removing large initial offsets first.
+
+        To be compared with ``model_timer_deviation_error()``, which simulates
+        only deterministic components.
+
+        Args:
+            data: Timer data to be inverted (s).
+            fs: Data rate (Hz). Must be finite and > 0.
+            interp_order: Interpolation order. Must be a positive integer.
+            delta: Positive convergence threshold for numerical calculations.
+            maxiter: Positive maximum number of numerical iterations.
+
+        Returns:
+            Inverse timer data array (s).
+        """
+        data = _as_1d_float_array(data, "data")
+        fs = _validate_sampling_rate(fs)
+        interp_order = _validate_positive_int(interp_order, "interp_order")
+        delta = _validate_positive_float(delta, "delta")
+        maxiter = _validate_positive_int(maxiter, "maxiter")
+
+        initial_offset = data[0]
+        inverse = calculate_advancements(
+            data - initial_offset,
+            fs,
+            order=interp_order,
+            delta=delta,
+            maxiter=maxiter,
+        )
+        return inverse + initial_offset
+
+    def truncation(self, n_trunc: int) -> None:
+        """Truncate both ends of timer time-series in place.
+
+        Args:
+            n_trunc: Number of points to truncate at each end of each array.
+                Must satisfy ``n_trunc < len(data) // 2``.
+        """
+        n_trunc = _validate_non_negative_int(n_trunc, "n_trunc")
+        if n_trunc == 0:
+            return
+        data_len = self.tau.size
+        if n_trunc >= data_len // 2:
+            raise ValueError(
+                f"n_trunc ({n_trunc}) must be < len(data) // 2 ({data_len // 2})"
+            )
+
+        slc = slice(n_trunc, -n_trunc)
+        self.tau = self.tau[slc]
+        for timer_dict in (self.total, self.fit, self.fluc):
+            for key in ("raw", "inv"):
+                timer_dict[key] = timer_dict[key][slc]
+        if hasattr(self, "timer_dev_err"):
+            for key in ("estimate", "model"):
+                self.timer_dev_err[key] = self.timer_dev_err[key][slc]
