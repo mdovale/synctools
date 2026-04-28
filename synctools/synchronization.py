@@ -34,27 +34,208 @@
 # foreign countries or providing access to foreign persons.
 #
 import copy
+import logging
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
 import numpy as np
 import numpy.typing as npt
-from typing import List, Optional, Dict, Any, Callable, Union, Tuple
-from scipy import signal
-import scipy.optimize as optimize
-import logging
-logger = logging.getLogger(__name__)
+from scipy import optimize, signal
 
 from synctools.auxiliary import (
     build_kaiser_lpf_taps,
-    integral_rms,
-    convert_frequency_to_phase_in_time,
-    spectra,
-    get_asd_delay_factor,
     combination_2sig,
     combination_3sig,
+    convert_frequency_to_phase_in_time,
+    get_asd_delay_factor,
+    integral_rms,
+    spectra,
 )
-from synctools.frequency import FrequencyData
 from synctools.clock import Clock
+from synctools.frequency import FrequencyData
 from synctools.signals import TwoSignals, ThreeSignals
-from functools import partial
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_SENTINEL = "default"
+_MIN_SPECTRUM_SAMPLES = 100
+_OPTIMIZATION_PENALTY = 1e10
+
+
+def _validate_finite_float(value: float, name: str) -> float:
+    """Return ``value`` as a finite float."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a finite numeric scalar, got {value!r}")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite numeric scalar, got {value!r}") from exc
+    if not np.isfinite(result):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return result
+
+
+def _validate_positive_float(value: float, name: str) -> float:
+    """Return ``value`` as a positive finite float."""
+    result = _validate_finite_float(value, name)
+    if result <= 0:
+        if name == "fs":
+            raise ValueError(f"Sampling rate fs must be > 0, got {value}")
+        raise ValueError(f"{name} must be > 0, got {value}")
+    return result
+
+
+def _validate_non_negative_int(value: int, name: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return result
+
+
+def _validate_positive_int(value: int, name: str) -> int:
+    result = _validate_non_negative_int(value, name)
+    if result <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return result
+
+
+def _as_1d_float_array(
+    values: npt.ArrayLike,
+    name: str,
+    *,
+    allow_empty: bool = False,
+    copy_array: bool = False,
+) -> npt.NDArray[np.float64]:
+    """Return finite 1D data as ``float64``."""
+    try:
+        array = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a 1D numeric array") from exc
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be 1D array, got shape {array.shape}")
+    if not allow_empty and array.size == 0:
+        raise ValueError(f"{name} cannot be empty")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values")
+    if copy_array:
+        array = array.copy()
+    return array
+
+
+def _as_signal_arrays(
+    in_signals: Sequence[npt.ArrayLike],
+    *,
+    min_count: int,
+    max_count: Optional[int] = None,
+) -> List[npt.NDArray[np.float64]]:
+    """Validate input signal arrays and return finite 1D ``float64`` views."""
+    try:
+        signal_list = list(in_signals)
+    except TypeError as exc:
+        raise ValueError("in_signals must be a sequence of 1D arrays") from exc
+
+    if len(signal_list) < min_count:
+        raise ValueError(
+            f"Insufficient input signals for synchronization: got {len(signal_list)}, "
+            f"need at least {min_count}"
+        )
+    if max_count is not None and len(signal_list) > max_count:
+        raise ValueError(
+            f"Too many input signals: got {len(signal_list)}, maximum is {max_count}"
+        )
+
+    arrays = [
+        _as_1d_float_array(sig, f"Signal {index}") for index, sig in enumerate(signal_list)
+    ]
+    first_len = arrays[0].size
+    for index, sig in enumerate(arrays[1:], start=1):
+        if sig.size != first_len:
+            raise ValueError(
+                f"All input signals must have the same length: "
+                f"signal 0 has length {first_len}, signal {index} has length {sig.size}"
+            )
+    return arrays
+
+
+def _validate_model_and_domain(model: str, domain: str) -> None:
+    if model not in ("total", "fluc"):
+        raise ValueError(f"model must be 'total' or 'fluc', got {model}")
+    if domain not in ("time", "freq"):
+        raise ValueError(f"domain must be 'time' or 'freq', got {domain}")
+
+
+def _validate_n_truncate_for_length(n_truncate: int, data_len: int) -> int:
+    n_truncate = _validate_non_negative_int(n_truncate, "n_truncate")
+    if n_truncate == 0:
+        return n_truncate
+    if n_truncate >= data_len // 2:
+        raise ValueError(
+            f"n_truncate ({n_truncate}) must be < len(data) // 2 ({data_len // 2})"
+        )
+    return n_truncate
+
+
+def _max_safe_truncation(data_len: int) -> int:
+    return max(0, data_len // 2 - 1)
+
+
+def _coerce_offset_vector(
+    offsets: npt.ArrayLike,
+    expected_length: int,
+    name: str = "init_offsets",
+) -> npt.NDArray[np.float64]:
+    offset_array = _as_1d_float_array(
+        offsets,
+        name,
+        allow_empty=expected_length == 0,
+        copy_array=True,
+    )
+    if offset_array.size != expected_length:
+        raise ValueError(
+            f"{name} must have length {expected_length} "
+            f"(number of secondary signals), got {offset_array.size}"
+        )
+    return offset_array
+
+
+def _coerce_weights(
+    weights: Union[str, npt.ArrayLike, None],
+    expected_length: int,
+) -> npt.NDArray[np.float64]:
+    if weights is None:
+        return np.ones(expected_length, dtype=np.float64)
+    if isinstance(weights, str):
+        if weights != _DEFAULT_SENTINEL:
+            raise ValueError(f"weights must be '{_DEFAULT_SENTINEL}' or a numeric vector")
+        return np.ones(expected_length, dtype=np.float64)
+
+    weight_array = _as_1d_float_array(weights, "weights", copy_array=True)
+    if weight_array.size != expected_length:
+        raise ValueError(
+            f"weights must have length {expected_length} (number of carriers), "
+            f"got {weight_array.size}"
+        )
+    return weight_array
+
+
+def _expected_signal_count(
+    desync: object,
+    combination: Callable,
+) -> Optional[int]:
+    if isinstance(desync, ThreeSignals):
+        return 3
+    if isinstance(desync, TwoSignals):
+        return 2
+
+    combiner_func = getattr(combination, "func", combination)
+    combiner_name = getattr(combiner_func, "__name__", "")
+    if combiner_func is combination_3sig or combiner_name == "combination_3sig":
+        return 3
+    if combiner_func is combination_2sig or combiner_name == "combination_2sig":
+        return 2
+    return None
 
 
 class Synchronization:
@@ -165,19 +346,11 @@ class Synchronization:
             >>> sync.processing(signals, init_offsets=[0.0, 0.0])
             >>> print(f"Time offsets: {sync.timer_offsets} s")
         """
-        # Validate inputs
-        if fs <= 0:
-            raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-        if model not in ("total", "fluc"):
-            raise ValueError(f"model must be 'total' or 'fluc', got {model}")
-        if domain not in ("time", "freq"):
-            raise ValueError(f"domain must be 'time' or 'freq', got {domain}")
-        if interp_order <= 0:
-            raise ValueError(f"interp_order must be positive, got {interp_order}")
-        if n_trunc < 0:
-            raise ValueError(f"n_trunc must be non-negative, got {n_trunc}")
-        if lpf_cutoff <= 0:
-            raise ValueError(f"lpf_cutoff must be > 0, got {lpf_cutoff}")
+        fs = _validate_positive_float(fs, "fs")
+        _validate_model_and_domain(model, domain)
+        interp_order = _validate_positive_int(interp_order, "interp_order")
+        n_trunc = _validate_non_negative_int(n_trunc, "n_trunc")
+        lpf_cutoff = _validate_positive_float(lpf_cutoff, "lpf_cutoff")
         if lpf_cutoff >= fs / 2:
             raise ValueError(
                 f"lpf_cutoff ({lpf_cutoff}) must be < fs/2 ({fs/2})"
@@ -205,18 +378,18 @@ class Synchronization:
         """
         # : design low-pass filter taps
         # (generated in any case for a result in the time domain)
-        width = 0.5*self.lpf_cutoff
-        f_pass = 0.5*(2.0*self.lpf_cutoff - width)
-        f_stop = 0.5*(2.0*self.lpf_cutoff + width)
+        width = 0.5 * self.lpf_cutoff
+        f_pass = 0.5 * (2.0 * self.lpf_cutoff - width)
+        f_stop = 0.5 * (2.0 * self.lpf_cutoff + width)
         self.lpf_taps = build_kaiser_lpf_taps(fs=self.fs, f_pass=f_pass, f_stop=f_stop)
-        self.lpf_taps = (self.lpf_taps,[1])
+        self.lpf_taps = (self.lpf_taps, [1])
         self.lpf_size = len(self.lpf_taps[0])
 
     def processing(
         self,
         ccs: List,
         init_offsets: List[float],
-        weights: Union[str, List[float]] = 'default',
+        weights: Union[str, npt.ArrayLike, None] = _DEFAULT_SENTINEL,
         bypass: bool = False
     ) -> None:
         """Process synchronization of carrier signals.
@@ -261,67 +434,67 @@ class Synchronization:
             >>> sync.processing(signals, init_offsets=[0.0, 0.0])
             >>> print(f"Optimized offsets: {sync.timer_offsets} s")
         """
-        # Validate number of carriers
-        if len(ccs) < 2 or len(ccs) > 3:
+        try:
+            ccs_list = list(ccs)
+        except TypeError as exc:
+            raise ValueError("ccs must be a sequence of FrequencyData objects") from exc
+
+        if len(ccs_list) < 2 or len(ccs_list) > 3:
             raise ValueError(
-                f"Number of carriers must be 2 or 3, got {len(ccs)}"
+                f"Number of carriers must be 2 or 3, got {len(ccs_list)}"
             )
-        
-        # Validate combiner consistency
-        # Check if combiner expects 2 or 3 signals by inspecting the function
-        from synctools.auxiliary import combination_2sig, combination_3sig
-        from synctools.signals import TwoSignals, ThreeSignals
-        
-        # Determine expected number of signals from desync object type
-        if isinstance(self.desync, ThreeSignals):
-            expected_n_signals = 3
-        elif isinstance(self.desync, TwoSignals):
-            expected_n_signals = 2
-        else:
-            # Fallback: inspect the combiner function
-            combiner_func = self.combination.func if hasattr(self.combination, 'func') else self.combination
-            if combiner_func is combination_3sig or combiner_func.__name__ == 'combination_3sig':
-                expected_n_signals = 3
-            elif combiner_func is combination_2sig or combiner_func.__name__ == 'combination_2sig':
-                expected_n_signals = 2
-            else:
-                # Cannot determine, skip validation
-                expected_n_signals = None
-        
-        if expected_n_signals is not None and len(ccs) != expected_n_signals:
+
+        expected_n_signals = _expected_signal_count(self.desync, self.combination)
+        if expected_n_signals is not None and len(ccs_list) != expected_n_signals:
             raise ValueError(
-                f"Number of carriers ({len(ccs)}) does not match combiner type: "
+                f"Number of carriers ({len(ccs_list)}) does not match combiner type: "
                 f"expected {expected_n_signals} signals for "
                 f"{'ThreeSignals' if expected_n_signals == 3 else 'TwoSignals'} combiner"
             )
-        
-        # Validate init_offsets length
-        if len(init_offsets) != len(ccs) - 1:
-            raise ValueError(
-                f"init_offsets must have length {len(ccs) - 1} "
-                f"(number of secondary signals), got {len(init_offsets)}"
-            )
-        
-        # Validate weights
-        if weights != 'default':
-            if len(weights) != len(ccs):
+
+        first_len: Optional[int] = None
+        for index, cc in enumerate(ccs_list):
+            total = _as_1d_float_array(getattr(cc, "total", None), f"ccs[{index}].total")
+            tau = _as_1d_float_array(getattr(cc, "tau", None), f"ccs[{index}].tau")
+            cc_fs = _validate_positive_float(getattr(cc, "fs", None), f"ccs[{index}].fs")
+            if total.size != tau.size:
                 raise ValueError(
-                    f"weights must have length {len(ccs)} (number of carriers), "
-                    f"got {len(weights)}"
+                    f"ccs[{index}].tau must have same length as ccs[{index}].total "
+                    f"({tau.size} vs {total.size})"
+                )
+            if not np.isclose(cc_fs, self.fs):
+                raise ValueError(
+                    f"ccs[{index}].fs ({cc_fs}) must match Synchronization.fs ({self.fs})"
+                )
+            if first_len is None:
+                first_len = total.size
+            elif total.size != first_len:
+                raise ValueError(
+                    f"All carrier signals must have the same length: "
+                    f"ccs[0] has length {first_len}, ccs[{index}] has length {total.size}"
                 )
 
-        # : === Register signals =====
-        self.ccs = copy.deepcopy(ccs)
-        self.init_offsets = init_offsets
-        self.n_clocks = len([cc.diff_clock for cc in self.ccs if cc.clock_registered]) # number of secondary clocks
-        self.is3S = True if len(self.ccs)==3 else False # three signal sync or not
-        if weights == 'default':
-            self.weights = [1]*len(self.ccs)
-        else:
-            self.weights = weights
+        if first_len is None:
+            raise ValueError("ccs cannot be empty")
+        _validate_n_truncate_for_length(self.n_trunc, first_len)
 
-        # : === Synchronization =====
-        self.timer_offsets = self.run_optimization(self.ccs) if not bypass else np.array(init_offsets)
+        init_offsets_array = _coerce_offset_vector(init_offsets, len(ccs_list) - 1)
+        weights_array = _coerce_weights(weights, len(ccs_list))
+
+        # : === Register signals =====
+        self.ccs = copy.deepcopy(ccs_list)
+        self.init_offsets = init_offsets_array
+        self.n_clocks = sum(1 for cc in self.ccs if getattr(cc, "clock_registered", False))
+        self.is3S = len(self.ccs) == 3
+        self.weights = weights_array
+
+        if bypass:
+            self.optimization_result = None
+            self.timer_offsets = self.init_offsets.copy()
+            self.update_timer_and_time_stamping_and_truncation(self.ccs, self.timer_offsets)
+            self.tau = self.ccs[0].tau
+        else:
+            self.timer_offsets = self.run_optimization(self.ccs)
         self.generate_performances()
 
     def run_optimization(self, ccs: List) -> npt.NDArray[np.float64]:
@@ -334,7 +507,12 @@ class Synchronization:
             Optimized timer offsets array (s).
         """
         # : optimization
-        p_sync = optimize.minimize(fun=self.f_timer_offset, x0=self.init_offsets, args=(ccs), method=self.method)
+        p_sync = optimize.minimize(
+            fun=self.f_timer_offset,
+            x0=self.init_offsets,
+            args=(ccs,),
+            method=self.method,
+        )
         self.optimization_result = p_sync
         logger.info("Synchronization result [%s]", self.name)
         logger.info("TDIR result (sec) = %s", p_sync.x)
@@ -346,7 +524,9 @@ class Synchronization:
                 self.name,
                 p_sync.message,
             )
-        timer_offsets = p_sync.x
+        timer_offsets = np.asarray(p_sync.x, dtype=np.float64)
+        if not np.all(np.isfinite(timer_offsets)):
+            raise ValueError(f"Optimizer returned non-finite timer offsets: {timer_offsets}")
 
         # : update carriers with optimized timers
         self.update_timer_and_time_stamping_and_truncation(self.ccs, timer_offsets)
@@ -368,66 +548,73 @@ class Synchronization:
         Returns:
             RMS value (dimensionless).
         """
+        try:
+            timer_offsets = _coerce_offset_vector(param, len(ccs) - 1, name="timer_offsets")
+        except ValueError:
+            return _OPTIMIZATION_PENALTY
 
-        _ccs = copy.deepcopy(ccs)
-        timer_offsets = param
-        self.update_timer_and_time_stamping_and_truncation(_ccs, timer_offsets)
+        try:
+            _ccs = copy.deepcopy(ccs)
+            self.update_timer_and_time_stamping_and_truncation(_ccs, timer_offsets)
+        except (ValueError, ZeroDivisionError, FloatingPointError) as exc:
+            logger.debug("Rejecting invalid synchronization trial %s: %s", timer_offsets, exc)
+            return _OPTIMIZATION_PENALTY
 
-        if self.domain=="time":
+        if self.domain == "time":
             _, _, phase = self.IO_compute_TDIR_output(_ccs, skip_asd_computation=True)
             phase_output_t = phase["time"]
             
             # Check if phase output is empty or too short
             if len(phase_output_t) == 0:
                 # Return large penalty for empty data
-                return 1e10
+                return _OPTIMIZATION_PENALTY
             
             phase_output_t = signal.detrend(phase_output_t, type='linear')
-            RMS = 0
-            tap_size = len(self.lpf_taps[0])*len(self.lpf_taps[1])
-            start = tap_size*5 # long warm-up time
+            tap_size = len(self.lpf_taps[0]) * len(self.lpf_taps[1])
+            start = tap_size * 5 # long warm-up time
             stop = tap_size
             
             # Check if we have enough data after filtering
             if len(phase_output_t) <= start + stop:
                 # Return large penalty for insufficient data
-                return 1e10
+                return _OPTIMIZATION_PENALTY
             
             phase_filt_t = signal.lfilter(*self.lpf_taps, phase_output_t)[start:-stop]
             
             # Check if filtered data is empty
             if len(phase_filt_t) == 0:
-                return 1e10
+                return _OPTIMIZATION_PENALTY
             
-            RMS += np.mean(phase_filt_t**2)
+            RMS = np.mean(phase_filt_t**2)
 
-        elif self.domain=="freq":
+        elif self.domain == "freq":
             frfr, _, phase = self.IO_compute_TDIR_output(_ccs, skip_asd_computation=False)
             
             # Check if phase output is empty
             if phase["time"] is not None and len(phase["time"]) == 0:
-                return 1e10
+                return _OPTIMIZATION_PENALTY
             
             # Check if ASD computation succeeded
             if phase["asd"] is None or len(phase["asd"]) == 0:
-                return 1e10
+                return _OPTIMIZATION_PENALTY
             
             if frfr is None or len(frfr) == 0:
-                return 1e10
+                return _OPTIMIZATION_PENALTY
             
-            RMS = 0
             _rms = integral_rms(frfr, phase["asd"], [0, self.lpf_cutoff])
-            RMS += _rms**2
+            RMS = _rms**2
         else:
             raise ValueError(f"invalid domain name {self.domain}")
 
-        return RMS
+        if not np.isfinite(RMS):
+            return _OPTIMIZATION_PENALTY
+        return float(RMS)
 
     def update_timer_and_time_stamping_and_truncation(
         self,
         ccs: List,
-        timer_offsets: Union[str, npt.NDArray[np.float64]] = 'default',
-        shifts: Union[str, List[npt.NDArray[np.float64]]] = 'default'
+        timer_offsets: Union[str, npt.ArrayLike] = _DEFAULT_SENTINEL,
+        shifts: Union[str, List[npt.NDArray[np.float64]], None] = _DEFAULT_SENTINEL
     ) -> None:
         """Update time, time-stamping both carrier and clock and truncate both.
         
@@ -436,28 +623,58 @@ class Synchronization:
             timer_offsets: Timer offsets (s). If 'default', uses self.timer_offsets.
             shifts: Optional pre-computed shifts arrays (samples). If 'default', computes from timer_offsets.
         """
-
-        # : determine Doppler type
         if self.model == "total":
-            Doppler_type = "total"
+            doppler_type = "total"
         elif self.model == "fluc":
-            Doppler_type = "fit"
+            doppler_type = "fit"
         else:
             raise ValueError(f"invalid model name {self.model}")
 
-        idx = 0
+        n_registered = sum(1 for cc in ccs if getattr(cc, "clock_registered", False))
+        if isinstance(timer_offsets, str):
+            if timer_offsets != _DEFAULT_SENTINEL:
+                raise ValueError(f"timer_offsets must be '{_DEFAULT_SENTINEL}' or a numeric vector")
+            if not hasattr(self, "timer_offsets"):
+                raise ValueError("timer_offsets are not available yet")
+            timer_offsets_array = _coerce_offset_vector(
+                self.timer_offsets,
+                n_registered,
+                name="timer_offsets",
+            )
+        else:
+            timer_offsets_array = _coerce_offset_vector(
+                timer_offsets,
+                n_registered,
+                name="timer_offsets",
+            )
+
+        if isinstance(shifts, str):
+            if shifts != _DEFAULT_SENTINEL:
+                raise ValueError(f"shifts must be '{_DEFAULT_SENTINEL}' or a list of arrays")
+            shifts_list = [None] * n_registered
+        elif shifts is None:
+            shifts_list = [None] * n_registered
+        else:
+            shifts_list = list(shifts)
+            if len(shifts_list) != n_registered:
+                raise ValueError(
+                    f"shifts must have length {n_registered} (number of registered clocks), "
+                    f"got {len(shifts_list)}"
+                )
+
+        registered_index = 0
         for cc in ccs:
-            if cc.clock_registered:
-                _timer_offsets = None if isinstance(timer_offsets, str) else timer_offsets[idx]
-                _shifts = None if isinstance(shifts, str) else shifts[idx]
+            if getattr(cc, "clock_registered", False):
                 cc.timing_transformation(
-                    fs=self.fs, timer_offset=_timer_offsets,
+                    fs=self.fs,
+                    timer_offset=timer_offsets_array[registered_index],
                     interp_order=self.interp_order,
-                    n_trunc=self.n_trunc, Doppler_type=Doppler_type,
-                    shifts=_shifts
-                    )
-                idx += 1
-            else: # only truncation if primary
+                    n_trunc=self.n_trunc,
+                    Doppler_type=doppler_type,
+                    shifts=shifts_list[registered_index],
+                )
+                registered_index += 1
+            else:  # only truncation if primary or no clock is registered
                 cc.truncation(self.n_trunc)
 
     def IO_compute_TDIR_output(
@@ -479,11 +696,9 @@ class Synchronization:
         """
 
         if self.model == "total":
-            _ccs = []
-            for cc in ccs:
-                _ccs.append(cc.total)
+            _ccs = [cc.total for cc in ccs]
         elif self.model == "fluc":
-            _ccs=[]
+            _ccs = []
             for cc in ccs:
                 if not cc.clock_registered:
                     _ccs.append(cc.fluc)
@@ -492,7 +707,7 @@ class Synchronization:
                     _ccs.append(_cc)
         else:
             raise ValueError(f"invalid model name {self.model}")
-        _ccs = np.array(_ccs).T
+        _ccs = np.column_stack(_ccs)
 
         return self.compute_TDIR_output(_ccs, skip_asd_computation)
 
@@ -513,8 +728,17 @@ class Synchronization:
             - freq_dict: Dictionary with 'time' (Hz) and 'asd' (Hz/√Hz) keys
             - phase_dict: Dictionary with 'time' (rad) and 'asd' (rad/√Hz) keys
         """
+        ccs = np.asarray(ccs, dtype=np.float64)
+        if ccs.ndim != 2:
+            raise ValueError(f"ccs must be a 2D array, got shape {ccs.shape}")
+        if ccs.shape[1] != len(self.weights):
+            raise ValueError(
+                f"ccs has {ccs.shape[1]} signals but weights has {len(self.weights)} entries"
+            )
+        if not np.all(np.isfinite(ccs)):
+            raise ValueError("ccs must contain only finite values")
 
-        weights = np.array([np.full(ccs.shape[0], w) for w in self.weights]).T
+        weights = np.broadcast_to(self.weights, ccs.shape)
         freq_output_t = self.combination(ccs, weights=weights)
         
         # Check if combination resulted in empty array
@@ -524,17 +748,24 @@ class Synchronization:
                 # Return empty arrays with proper structure
                 empty_freq = np.array([])
                 empty_phase = np.array([])
-                return empty_freq, {"time": empty_freq, "asd": empty_phase}, {"time": empty_phase, "asd": empty_phase}
+                return (
+                    empty_freq,
+                    {"time": empty_freq, "asd": empty_phase},
+                    {"time": empty_phase, "asd": empty_phase},
+                )
             else:
                 empty_freq = np.array([])
                 empty_phase = np.array([])
-                return None, {"time": empty_freq, "asd": None}, {"time": empty_phase, "asd": None}
+                return None, {"time": empty_freq, "asd": None}, {
+                    "time": empty_phase,
+                    "asd": None,
+                }
         
         phase_output_t = convert_frequency_to_phase_in_time(freq_output_t, self.fs)
 
         if not skip_asd_computation:
             # Check if data is long enough for spectral analysis
-            if len(freq_output_t) < 100:
+            if len(freq_output_t) < _MIN_SPECTRUM_SAMPLES:
                 # Data too short, return empty ASD arrays
                 empty_asd = np.array([])
                 empty_frfr = np.array([])
@@ -549,7 +780,7 @@ class Synchronization:
                 phase = {"time": phase_output_t, "asd": phase_output_asd}
             except (ZeroDivisionError, ValueError) as e:
                 # If spectra computation fails, return empty ASD arrays
-                logger.warning(f"Spectra computation failed: {e}. Returning empty ASD arrays.")
+                logger.warning("Spectra computation failed: %s. Returning empty ASD arrays.", e)
                 empty_asd = np.array([])
                 empty_frfr = np.array([])
                 freq = {"time": freq_output_t, "asd": empty_asd}
@@ -567,7 +798,7 @@ class Synchronization:
         frfr: npt.NDArray[np.float64],
         ccs: List,
         combi_asd: npt.NDArray[np.float64],
-        factor: float = 1.0,
+        factor: Optional[float] = None,
         test_freq: Optional[float] = None
     ) -> Tuple[float, npt.NDArray[np.float64]]:
         """Compute TDIR precision.
@@ -586,15 +817,24 @@ class Synchronization:
             - TDIR_precision: TDIR accuracy (s)
             - TDIR_residual_asd: Residual phase noise ASD array (rad/√Hz)
         """
+        frfr = _as_1d_float_array(frfr, "frfr")
+        combi_asd = _as_1d_float_array(combi_asd, "combi_asd")
+        if combi_asd.size != frfr.size:
+            raise ValueError(
+                f"combi_asd must have same length as frfr ({combi_asd.size} vs {frfr.size})"
+            )
 
         # : choose a test Fourier frequency
         if test_freq is None: # use the minimum value over the band
             idx = np.argmin(combi_asd)
         else: # use the value at the tone
-            idx = np.argmin(np.abs(np.array(frfr) - test_freq))
+            test_freq = _validate_finite_float(test_freq, "test_freq")
+            idx = np.argmin(np.abs(frfr - test_freq))
 
         # : compute a TDIR accuracy (sec)
-        factor = np.sqrt(self.n_clocks)
+        factor = np.sqrt(self.n_clocks) if factor is None else _validate_positive_float(
+            factor, "factor"
+        )
         if factor == 0:
             logger.warning("Cannot compute TDIR accuracy without registered secondary clocks")
             return np.nan, np.array([])
@@ -603,20 +843,31 @@ class Synchronization:
         if ccs[0].asd is None or len(ccs[0].asd) == 0:
             logger.warning("Cannot compute TDIR accuracy because input ASD is empty")
             return np.nan, np.array([])
-        input_phase_asd = ccs[0].asd/ccs[0].fourier_freq
-        denominator = 2*factor*input_phase_asd[idx]
+        input_asd = _as_1d_float_array(ccs[0].asd, "ccs[0].asd")
+        input_frfr = _as_1d_float_array(ccs[0].fourier_freq, "ccs[0].fourier_freq")
+        if input_asd.size != input_frfr.size:
+            raise ValueError(
+                f"ccs[0].asd must have same length as ccs[0].fourier_freq "
+                f"({input_asd.size} vs {input_frfr.size})"
+            )
+        if idx >= input_asd.size:
+            logger.warning("Cannot compute TDIR accuracy because ASD lengths differ")
+            return np.nan, np.full_like(input_asd, np.nan)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            input_phase_asd = input_asd / input_frfr
+        denominator = 2 * factor * input_phase_asd[idx]
         if denominator == 0 or frfr[idx] == 0:
             logger.warning("Cannot compute TDIR accuracy due to zero denominator or frequency")
             return np.nan, np.full_like(input_phase_asd, np.nan)
-        arcsin_argument = combi_asd[idx]/denominator
+        arcsin_argument = combi_asd[idx] / denominator
         if not np.isfinite(arcsin_argument) or abs(arcsin_argument) > 1:
             logger.warning("TDIR arcsin argument is outside [-1, 1]: %s", arcsin_argument)
             return np.nan, np.full_like(input_phase_asd, np.nan)
-        TDIR_precision = np.arcsin(arcsin_argument)/(np.pi*frfr[idx])
+        TDIR_precision = np.arcsin(arcsin_argument) / (np.pi * frfr[idx])
 
         # : derive a residual phase noise
-        delay_factor = get_asd_delay_factor(ccs[0].fourier_freq, TDIR_precision)
-        TDIR_residual_asd = factor*delay_factor*input_phase_asd
+        delay_factor = get_asd_delay_factor(input_frfr, TDIR_precision)
+        TDIR_residual_asd = factor * delay_factor * input_phase_asd
         if test_freq is None:
             logger.info("TDIR accuracy = %s s (pass band = %s)", TDIR_precision, [0, self.lpf_cutoff])
         else:
@@ -646,7 +897,8 @@ class Synchronization:
         
         # Check if we have enough data for filtering
         if len(self.freq_filt) > 0:
-            self.freq_filt = signal.lfilter(*self.lpf_taps, self.freq_filt) # use LPF not to reject slow drifs in any case
+            # Use LPF to keep slow drifts in time-domain performance views.
+            self.freq_filt = signal.lfilter(*self.lpf_taps, self.freq_filt)
         else:
             self.freq_filt = np.array([])
         
@@ -654,14 +906,22 @@ class Synchronization:
         
         # Check if we have enough data for filtering
         if len(self.phase_filt) > 0:
-            self.phase_filt = signal.lfilter(*self.lpf_taps, self.phase_filt) # use LPF not to reject slow drifs in any case
+            self.phase_filt = signal.lfilter(*self.lpf_taps, self.phase_filt)
         else:
             self.phase_filt = np.array([])
 
         # Only compute TDIR accuracy if we have valid ASD data
-        if self.phase["asd"] is not None and len(self.phase["asd"]) > 0 and self.fourier_freq is not None and len(self.fourier_freq) > 0:
-            self.TDIR_precision, self.TDIR_residual_asd = self.compute_tdir_accuracy(self.fourier_freq,
-                self.ccs, combi_asd=self.phase["asd"])
+        if (
+            self.phase["asd"] is not None
+            and len(self.phase["asd"]) > 0
+            and self.fourier_freq is not None
+            and len(self.fourier_freq) > 0
+        ):
+            self.TDIR_precision, self.TDIR_residual_asd = self.compute_tdir_accuracy(
+                self.fourier_freq,
+                self.ccs,
+                combi_asd=self.phase["asd"],
+            )
         else:
             self.TDIR_precision = np.nan
             self.TDIR_residual_asd = np.array([])
@@ -772,170 +1032,133 @@ def sync_signals(
         ... )
         >>> print(f"Time offset: {synced.timer_offsets[0]:.6f} s")
     """
-    # Validate inputs
-    if fs <= 0:
-        raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-    
-    if len(in_signals) < 2:
-        raise ValueError(
-            f"Insufficient input signals for synchronization: got {len(in_signals)}, "
-            f"need at least 2"
-        )
-    if len(in_signals) > 3:
-        raise ValueError(
-            f"Too many input signals: got {len(in_signals)}, maximum is 3"
-        )
-    
-    # Convert to numpy arrays and validate
-    in_signals_arrays = []
-    for i, sig in enumerate(in_signals):
-        sig_array = np.asarray(sig, dtype=np.float64)
-        if sig_array.ndim != 1:
-            raise ValueError(
-                f"Signal {i} must be 1D array, got shape {sig_array.shape}"
-            )
-        if len(sig_array) == 0:
-            raise ValueError(f"Signal {i} cannot be empty")
-        in_signals_arrays.append(sig_array)
-    
-    # Check all signals have the same length
+    fs = _validate_positive_float(fs, "fs")
+    in_signals_arrays = _as_signal_arrays(in_signals, min_count=2, max_count=3)
     first_len = len(in_signals_arrays[0])
-    for i, sig in enumerate(in_signals_arrays[1:], 1):
-        if len(sig) != first_len:
-            raise ValueError(
-                f"All input signals must have the same length: "
-                f"signal 0 has length {first_len}, signal {i} has length {len(sig)}"
-            )
-    
-    # Validate model and domain
-    if model not in ("total", "fluc"):
-        raise ValueError(f"model must be 'total' or 'fluc', got {model}")
-    if domain not in ("time", "freq"):
-        raise ValueError(f"domain must be 'time' or 'freq', got {domain}")
-    
-    if interp_order <= 0:
-        raise ValueError(f"interp_order must be positive, got {interp_order}")
-    
-    # Validate n_truncate if provided
+    _validate_model_and_domain(model, domain)
+    interp_order = _validate_positive_int(interp_order, "interp_order")
+
     if n_truncate is not None:
-        if n_truncate < 0:
-            raise ValueError(f"n_truncate must be non-negative, got {n_truncate}")
-        if n_truncate >= first_len // 2:
-            raise ValueError(
-                f"n_truncate ({n_truncate}) must be < len(data) // 2 ({first_len // 2})"
-            )
+        n_truncate = _validate_n_truncate_for_length(n_truncate, first_len)
     
-    signals = []
     clocks = []
-    init_dt: List[float] = []
+    init_dt: npt.NDArray[np.float64]
+    log = logger if logger is not None else logging.getLogger(__name__)
 
-    if logger is None:
-        logger = logging.getLogger(__name__)
+    log.debug("Starting up...")
 
-    logger.debug(f"Starting up...")
-
-    if len(in_signals_arrays) == 2:
-        signals.append(FrequencyData(in_signals_arrays[0], fs))
-        signals.append(FrequencyData(in_signals_arrays[1], fs))
-    elif len(in_signals_arrays) == 3:
-        signals.append(FrequencyData(in_signals_arrays[0], fs))
-        signals.append(FrequencyData(in_signals_arrays[1], fs))
-        signals.append(FrequencyData(in_signals_arrays[2], fs))
+    signals = [FrequencyData(sig, fs) for sig in in_signals_arrays]
 
     if init_offsets is not None:
-        if len(init_offsets) != len(signals)-1:
-            raise ValueError(
-                f"init_offsets must have length {len(signals)-1} "
-                f"(number of secondary signals), got {len(init_offsets)}"
-            )
-        init_dt = init_offsets
+        init_dt = _coerce_offset_vector(init_offsets, len(signals) - 1)
         if n_truncate is None:
-            n_truncate = int(2*max(abs(dt) for dt in init_dt) * fs)
-            # Ensure n_truncate is valid
-            if n_truncate >= first_len // 2:
-                n_truncate = max(1, first_len // 2 - 1)
-                logger.warning(
-                    f"Auto-calculated n_truncate would be too large, "
-                    f"setting to {n_truncate}"
+            n_truncate = int(2 * np.max(np.abs(init_dt)) * fs)
+            max_safe_truncation = _max_safe_truncation(first_len)
+            if n_truncate > max_safe_truncation:
+                log.warning(
+                    "Auto-calculated n_truncate (%s) is too large for data length "
+                    "(%s), setting to %s",
+                    n_truncate,
+                    first_len,
+                    max_safe_truncation,
                 )
+                n_truncate = max_safe_truncation
     else:
-        for _ in range(len(signals) - 1):
-            init_dt.append(0.0)
+        init_dt = np.zeros(len(signals) - 1, dtype=np.float64)
         if n_truncate is None:
             n_truncate = 150
-            # Ensure n_truncate is valid
-            if n_truncate >= first_len // 2:
-                n_truncate = max(1, first_len // 2 - 1)
-                logger.warning(
-                    f"Default n_truncate ({150}) is too large for data length "
-                    f"({first_len}), setting to {n_truncate}"
+            max_safe_truncation = _max_safe_truncation(first_len)
+            if n_truncate > max_safe_truncation:
+                log.warning(
+                    "Default n_truncate (%s) is too large for data length (%s), "
+                    "setting to %s",
+                    n_truncate,
+                    first_len,
+                    max_safe_truncation,
                 )
+                n_truncate = max_safe_truncation
 
-    init_dsamples = list(np.array(init_dt)*fs)
-    logger.debug(f"Initial offsets of {init_dt} seconds ({init_dsamples} samples), truncation set to {n_truncate:d}")
+    init_dsamples = list(init_dt * fs)
+    log.debug(
+        "Initial offsets of %s seconds (%s samples), truncation set to %d",
+        init_dt.tolist(),
+        init_dsamples,
+        n_truncate,
+    )
 
     if clock_refs is not None:
-        if len(clock_refs) != len(signals)-1:
+        if len(clock_refs) != len(signals) - 1:
             raise ValueError(
                 f"clock_refs must have length {len(signals)-1} "
                 f"(number of secondary signals), got {len(clock_refs)}"
             )
         # Validate clock_refs array lengths
+        clock_refs_arrays = []
         for i, ref in enumerate(clock_refs):
-            ref_array = np.asarray(ref, dtype=np.float64)
-            if ref_array.ndim != 1:
-                raise ValueError(
-                    f"clock_refs[{i}] must be 1D array, got shape {ref_array.shape}"
-                )
-            if len(ref_array) != first_len:
+            ref_array = _as_1d_float_array(ref, f"clock_refs[{i}]")
+            if ref_array.size != first_len:
                 raise ValueError(
                     f"clock_refs[{i}] must have same length as input signals "
-                    f"({first_len}), got {len(ref_array)}"
+                    f"({first_len}), got {ref_array.size}"
                 )
+            clock_refs_arrays.append(ref_array)
+        clock_refs = clock_refs_arrays
 
-    logger.debug("Creating and registering clock objects...")
+    log.debug("Creating and registering clock objects...")
 
     if clock_refs is None:
-        logger.debug("No clock reference provided, assuming zero clock jitter")
-        for _ in range(len(signals)-1):
+        log.debug("No clock reference provided, assuming zero clock jitter")
+        for _ in range(len(signals) - 1):
             # Create zero clock reference
             clock_rd = FrequencyData(np.zeros(first_len), fs)
             clocks.append(Clock(clock_rd))
     else:
-        logger.debug("Clock reference provided, using custom clock jitter")
+        log.debug("Clock reference provided, using custom clock jitter")
         for ref in clock_refs:
             # Create FrequencyData from clock reference array
             clock_rd = FrequencyData(ref, fs)
             clocks.append(Clock(clock_rd))
 
     for i, clk in enumerate(clocks):
-        signals[i+1].register_differential_clock(clk)
+        signals[i + 1].register_differential_clock(clk)
 
     if len(signals) == 2:
-        logger.debug("Creating TwoSignals object")
+        log.debug("Creating TwoSignals object")
         unsynced_obj = TwoSignals([*signals], p_lpsd)
         synced_obj_name = "2-signal-sync"
     else:
-        logger.debug("Creating ThreeSignals object")
+        log.debug("Creating ThreeSignals object")
         unsynced_obj = ThreeSignals([*signals], p_lpsd)
-        logger.debug(f"Derived signs for the three-signal combination: {unsynced_obj.signs}")  
-        synced_obj_name = "3-signal-sync"  
+        log.debug("Derived signs for the three-signal combination: %s", unsynced_obj.signs)
+        synced_obj_name = "3-signal-sync"
 
     if isinstance(unsynced_obj, ThreeSignals):
         signal_combiner = partial(combination_3sig, signs=unsynced_obj.signs)
-    else: 
+    else:
         signal_combiner = partial(combination_2sig)
     
-    synced_obj = Synchronization(signal_combiner, unsynced_obj, fs, p_lpsd,
-        model=model, domain=domain, method=method,
-        interp_order=interp_order, n_trunc=n_truncate,
-        myfolder='/result_sync/', name=synced_obj_name
+    synced_obj = Synchronization(
+        signal_combiner,
+        unsynced_obj,
+        fs,
+        p_lpsd,
+        model=model,
+        domain=domain,
+        method=method,
+        interp_order=interp_order,
+        n_trunc=n_truncate,
+        myfolder='/result_sync/',
+        name=synced_obj_name,
     )
 
-    logger.debug("Synchronizing...")
+    log.debug("Synchronizing...")
     synced_obj.processing(signals, init_offsets=init_dt)
-    final_dsamples = list(np.array(synced_obj.timer_offsets)*fs)
-    logger.debug(f"Synchronization finished with dt = {synced_obj.timer_offsets} seconds ({final_dsamples} samples)")
+    final_dsamples = list(np.asarray(synced_obj.timer_offsets) * fs)
+    log.debug(
+        "Synchronization finished with dt = %s seconds (%s samples)",
+        synced_obj.timer_offsets,
+        final_dsamples,
+    )
 
     return unsynced_obj, synced_obj
 
@@ -1053,72 +1276,35 @@ def sync_multiple_twosignals(
         >>> print(f"Time offset A-C: {results[1][1].timer_offsets[0]:.6f} s")
         >>> print(f"Time offset A-D: {results[2][1].timer_offsets[0]:.6f} s")
     """
-    # Validate inputs
-    if fs <= 0:
-        raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-    
-    if len(in_signals) < 2:
-        raise ValueError(
-            f"Insufficient input signals for synchronization: got {len(in_signals)}, "
-            f"need at least 2"
-        )
-    
-    # Convert to numpy arrays and validate
-    in_signals_arrays = []
-    for i, sig in enumerate(in_signals):
-        sig_array = np.asarray(sig, dtype=np.float64)
-        if sig_array.ndim != 1:
-            raise ValueError(
-                f"Signal {i} must be 1D array, got shape {sig_array.shape}"
-            )
-        if len(sig_array) == 0:
-            raise ValueError(f"Signal {i} cannot be empty")
-        in_signals_arrays.append(sig_array)
-    
-    # Check all signals have the same length
+    fs = _validate_positive_float(fs, "fs")
+    in_signals_arrays = _as_signal_arrays(in_signals, min_count=2)
     first_len = len(in_signals_arrays[0])
-    for i, sig in enumerate(in_signals_arrays[1:], 1):
-        if len(sig) != first_len:
-            raise ValueError(
-                f"All input signals must have the same length: "
-                f"signal 0 has length {first_len}, signal {i} has length {len(sig)}"
-            )
-    
-    # Validate model and domain
-    if model not in ("total", "fluc"):
-        raise ValueError(f"model must be 'total' or 'fluc', got {model}")
-    if domain not in ("time", "freq"):
-        raise ValueError(f"domain must be 'time' or 'freq', got {domain}")
-    
-    if interp_order <= 0:
-        raise ValueError(f"interp_order must be positive, got {interp_order}")
-    
-    # Validate n_truncate if provided
+    _validate_model_and_domain(model, domain)
+    interp_order = _validate_positive_int(interp_order, "interp_order")
+
     if n_truncate is not None:
-        if n_truncate < 0:
-            raise ValueError(f"n_truncate must be non-negative, got {n_truncate}")
-        if n_truncate >= first_len // 2:
-            raise ValueError(
-                f"n_truncate ({n_truncate}) must be < len(data) // 2 ({first_len // 2})"
-            )
+        n_truncate = _validate_n_truncate_for_length(n_truncate, first_len)
     
     # Validate init_offsets if provided
     n_pairs = len(in_signals_arrays) - 1
     if init_offsets is not None:
+        init_offsets = list(init_offsets)
         if len(init_offsets) != n_pairs:
             raise ValueError(
                 f"init_offsets must have length {n_pairs} (number of pairs), "
                 f"got {len(init_offsets)}"
             )
         for i, offset in enumerate(init_offsets):
-            if offset is not None and len(offset) != 1:
-                raise ValueError(
-                    f"init_offsets[{i}] must be None or a list of length 1, "
-                    f"got {offset}"
+            if offset is not None:
+                init_offsets[i] = _coerce_offset_vector(
+                    offset,
+                    1,
+                    name=f"init_offsets[{i}]",
                 )
     
     # Validate clock_refs if provided
     if clock_refs is not None:
+        clock_refs = list(clock_refs)
         if len(clock_refs) != n_pairs:
             raise ValueError(
                 f"clock_refs must have length {n_pairs} (number of pairs), "
@@ -1126,22 +1312,20 @@ def sync_multiple_twosignals(
             )
         for i, ref in enumerate(clock_refs):
             if ref is not None:
-                ref_array = np.asarray(ref, dtype=np.float64)
-                if ref_array.ndim != 1:
-                    raise ValueError(
-                        f"clock_refs[{i}] must be None or a 1D array, "
-                        f"got shape {ref_array.shape}"
-                    )
-                if len(ref_array) != first_len:
+                ref_array = _as_1d_float_array(ref, f"clock_refs[{i}]")
+                if ref_array.size != first_len:
                     raise ValueError(
                         f"clock_refs[{i}] must have same length as input signals "
-                        f"({first_len}), got {len(ref_array)}"
+                        f"({first_len}), got {ref_array.size}"
                     )
+                clock_refs[i] = ref_array
     
-    if logger is None:
-        logger = logging.getLogger(__name__)
+    log = logger if logger is not None else logging.getLogger(__name__)
     
-    logger.debug(f"Starting multiple TwoSignal synchronizations with {len(in_signals_arrays)} signals")
+    log.debug(
+        "Starting multiple TwoSignal synchronizations with %d signals",
+        len(in_signals_arrays),
+    )
     
     # Prepare default values
     if init_offsets is None:
@@ -1157,7 +1341,12 @@ def sync_multiple_twosignals(
         secondary_signal = in_signals_arrays[i]
         pair_index = i - 1
         
-        logger.debug(f"Synchronizing pair [A, signal_{i}] (pair {pair_index + 1}/{n_pairs})")
+        log.debug(
+            "Synchronizing pair [A, signal_%d] (pair %d/%d)",
+            i,
+            pair_index + 1,
+            n_pairs,
+        )
         
         # Prepare init_offset for this pair
         pair_init_offset = init_offsets[pair_index]
@@ -1180,15 +1369,16 @@ def sync_multiple_twosignals(
             interp_order=interp_order,
             n_truncate=n_truncate,
             clock_refs=pair_clock_refs,
-            logger=logger
+            logger=log,
         )
         
         results.append((unsynced_obj, synced_obj))
-        logger.debug(
-            f"Pair [A, signal_{i}] synchronized with offset = "
-            f"{synced_obj.timer_offsets[0]:.6f} s"
+        log.debug(
+            "Pair [A, signal_%d] synchronized with offset = %.6f s",
+            i,
+            synced_obj.timer_offsets[0],
         )
     
-    logger.debug(f"Completed {n_pairs} TwoSignal synchronizations")
+    log.debug("Completed %d TwoSignal synchronizations", n_pairs)
     
     return results
