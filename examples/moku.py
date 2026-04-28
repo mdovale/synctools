@@ -33,11 +33,11 @@
 # export authority as may be required before exporting such information to
 # foreign countries or providing access to foreign persons.
 #
-"""
-mokutools.sync: Synchronization of two Liquid Instruments Moku phasemeter data streams
+"""Example: synchronize two Liquid Instruments Moku phasemeter streams.
 
-The two Moku share a clock, but their data streams are
-misaligned by a non-integer number of samples
+The two Moku instruments share a clock, but their data streams are misaligned
+by a non-integer number of samples. This script prepares Moku data and calls
+synctools for offset recovery.
 """
 from __future__ import annotations
 

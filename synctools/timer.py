@@ -259,6 +259,8 @@ class TimerData:
 		"""
 		if n_trunc < 0:
 			raise ValueError(f"n_trunc must be non-negative, got {n_trunc}")
+		if n_trunc == 0:
+			return
 		data_len = len(self.tau)
 		if n_trunc >= data_len // 2:
 			raise ValueError(

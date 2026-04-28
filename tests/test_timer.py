@@ -215,6 +215,19 @@ class TestTimerDataTruncation:
         assert len(td.fit['inv']) == len(td.tau)
         assert len(td.fluc['raw']) == len(td.tau)
         assert len(td.fluc['inv']) == len(td.tau)
+
+    def test_zero_truncation_is_noop(self, sample_fs):
+        """Zero truncation should preserve timer arrays."""
+        n_samples = 100
+        frac_freq = np.zeros(n_samples)
+        fd = FrequencyData(frac_freq, sample_fs)
+        td = TimerData(fd, sample_fs)
+
+        td.truncation(0)
+
+        assert len(td.tau) == n_samples
+        assert len(td.total["raw"]) == n_samples
+        assert len(td.total["inv"]) == n_samples
     
     def test_truncation_validation(self, sample_fs):
         """Test truncation validation."""

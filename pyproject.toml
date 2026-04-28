@@ -35,6 +35,11 @@ dependencies = [
     "pytdi",
 ]
 
+[project.urls]
+Homepage = "https://github.com/mdovale/synctools"
+Repository = "https://github.com/mdovale/synctools"
+Issues = "https://github.com/mdovale/synctools/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
@@ -47,12 +52,17 @@ test = [
     "pytest>=7.0.0",
     "pytest-cov",
 ]
+docs = [
+    "sphinx",
+    "sphinx-autodoc-typehints",
+]
 
 [tool.setuptools]
 packages = ["synctools"]
 
 [tool.setuptools.package-data]
 "*" = ["*.txt", "*.md"]
+synctools = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -63,7 +73,6 @@ addopts = [
     "-v",
     "--tb=short",
     "--strict-markers",
-    "--disable-warnings",
 ]
 
 [tool.black]

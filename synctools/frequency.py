@@ -232,6 +232,10 @@ class FrequencyData:
             >>> fd.register_differential_clock(clock)
             >>> print(f"Clock registered: {fd.clock_registered}")
         """
+        from synctools.clock import Clock
+
+        if not isinstance(clock, Clock):
+            raise ValueError(f"clock must be a Clock instance, got {type(clock)}")
         self.diff_clock = copy.deepcopy(clock)
         self.timer_type = "raw" if self.diff_clock.primary_stamped else "inv"
         self.clock_sign = -1 if self.diff_clock.primary_stamped else +1
@@ -308,6 +312,8 @@ class FrequencyData:
             ...     fs=10.0, timer_offset=0.0, interp_order=121, n_trunc=150
             ... )
         """
+        if not self.clock_registered:
+            raise ValueError("A differential clock must be registered before timing_transformation")
         if fs <= 0:
             raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
         if interp_order <= 0:
@@ -384,6 +390,8 @@ class FrequencyData:
         """
         if n_trunc < 0:
             raise ValueError(f"n_trunc must be non-negative, got {n_trunc}")
+        if n_trunc == 0:
+            return
         if n_trunc >= len(self.total) // 2:
             raise ValueError(
                 f"n_trunc ({n_trunc}) must be < len(data) // 2 ({len(self.total) // 2})"

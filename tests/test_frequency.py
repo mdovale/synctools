@@ -33,6 +33,20 @@ class TestFrequencyDataBasic:
         
         with pytest.raises(ValueError, match="order must be non-negative"):
             FrequencyData(np.array([1.0, 2.0]), sample_fs, order=-1)
+
+    def test_register_differential_clock_validation(self, sample_fs):
+        """Registering a non-Clock object should fail clearly."""
+        fd = FrequencyData(np.array([1.0, 2.0]), sample_fs)
+
+        with pytest.raises(ValueError, match="clock must be a Clock instance"):
+            fd.register_differential_clock(object())
+
+    def test_timing_transformation_requires_clock(self, sample_fs):
+        """Timing transformation requires an explicitly registered clock."""
+        fd = FrequencyData(np.ones(10), sample_fs)
+
+        with pytest.raises(ValueError, match="differential clock must be registered"):
+            fd.timing_transformation(fs=sample_fs, n_trunc=0)
     
 class TestFrequencyDataLinearDrift:
     """Tests for FrequencyData with linear drifts."""
@@ -214,6 +228,16 @@ class TestFrequencyDataTruncation:
         assert len(fd.tau) == len(fd.total)
         assert len(fd.fit) == len(fd.total)
         assert len(fd.fluc) == len(fd.total)
+
+    def test_zero_truncation_is_noop(self, sample_fs):
+        """Zero truncation should preserve data instead of slicing to empty arrays."""
+        data = np.ones(100) * 1e6
+        fd = FrequencyData(data, sample_fs)
+
+        fd.truncation(0)
+
+        assert len(fd.total) == len(data)
+        assert np.allclose(fd.total, data)
     
     def test_truncation_validation(self, sample_fs):
         """Test truncation validation."""

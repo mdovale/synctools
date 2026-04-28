@@ -107,6 +107,7 @@ class Synchronization:
                          - Typical range: 5-121
                          - Higher values: better accuracy, slower computation
             n_trunc: Number of points to truncate at each end of arrays.
+                    - Same concept as n_truncate in sync_signals()
                     - Must satisfy: n_trunc < len(data) // 2
                     - Removes edge effects from time-shifting
             lpf_cutoff: Low-pass filter cutoff frequency.
@@ -334,10 +335,17 @@ class Synchronization:
         """
         # : optimization
         p_sync = optimize.minimize(fun=self.f_timer_offset, x0=self.init_offsets, args=(ccs), method=self.method)
-        print(f"# ===== Synchronization Result ["+self.name+"] ==========")
-        print(f"    TDIR result (sec) = {p_sync.x}")
-        print(f"    TDIR success = {p_sync.success}")
-        print(f"    TDIR message = {p_sync.message}")
+        self.optimization_result = p_sync
+        logger.info("Synchronization result [%s]", self.name)
+        logger.info("TDIR result (sec) = %s", p_sync.x)
+        logger.info("TDIR success = %s", p_sync.success)
+        logger.info("TDIR message = %s", p_sync.message)
+        if not p_sync.success:
+            logger.warning(
+                "Synchronization optimizer reported failure for %s: %s",
+                self.name,
+                p_sync.message,
+            )
         timer_offsets = p_sync.x
 
         # : update carriers with optimized timers
@@ -587,18 +595,32 @@ class Synchronization:
 
         # : compute a TDIR accuracy (sec)
         factor = np.sqrt(self.n_clocks)
-        if ccs[0].asd == None:
+        if factor == 0:
+            logger.warning("Cannot compute TDIR accuracy without registered secondary clocks")
+            return np.nan, np.array([])
+        if ccs[0].asd is None:
             ccs[0].compute_spectrum(self.p_lpsd)
+        if ccs[0].asd is None or len(ccs[0].asd) == 0:
+            logger.warning("Cannot compute TDIR accuracy because input ASD is empty")
+            return np.nan, np.array([])
         input_phase_asd = ccs[0].asd/ccs[0].fourier_freq
-        TDIR_precision = np.arcsin(combi_asd[idx]/(2*factor*input_phase_asd[idx]))/(np.pi*frfr[idx])
+        denominator = 2*factor*input_phase_asd[idx]
+        if denominator == 0 or frfr[idx] == 0:
+            logger.warning("Cannot compute TDIR accuracy due to zero denominator or frequency")
+            return np.nan, np.full_like(input_phase_asd, np.nan)
+        arcsin_argument = combi_asd[idx]/denominator
+        if not np.isfinite(arcsin_argument) or abs(arcsin_argument) > 1:
+            logger.warning("TDIR arcsin argument is outside [-1, 1]: %s", arcsin_argument)
+            return np.nan, np.full_like(input_phase_asd, np.nan)
+        TDIR_precision = np.arcsin(arcsin_argument)/(np.pi*frfr[idx])
 
         # : derive a residual phase noise
         delay_factor = get_asd_delay_factor(ccs[0].fourier_freq, TDIR_precision)
         TDIR_residual_asd = factor*delay_factor*input_phase_asd
         if test_freq is None:
-            print(f"    TDIR accuracy = {TDIR_precision} s (pass band = {[0,self.lpf_cutoff]})")
+            logger.info("TDIR accuracy = %s s (pass band = %s)", TDIR_precision, [0, self.lpf_cutoff])
         else:
-            print(f"    TDIR accuracy at {test_freq:.4f} Hz = {TDIR_precision} s")
+            logger.info("TDIR accuracy at %.4f Hz = %s s", test_freq, TDIR_precision)
 
         return TDIR_precision, TDIR_residual_asd
 
@@ -679,7 +701,7 @@ def sync_signals(
             - Must be > 0
         p_lpsd: SpecKit parameters dictionary.
                 Required keys: "olap", "bmin", "Lmin", "Jdes", "Kdes", "order",
-                "win", "psll", "pool". See speckit documentation for details.
+                "win", "psll". See speckit documentation for details.
         init_offsets: Optional list of initial timer offset guesses.
                      - Shape: (n_signals - 1,)
                      - Units: seconds
@@ -828,7 +850,7 @@ def sync_signals(
             )
         init_dt = init_offsets
         if n_truncate is None:
-            n_truncate = int(2*abs(max(init_dt) * fs))
+            n_truncate = int(2*max(abs(dt) for dt in init_dt) * fs)
             # Ensure n_truncate is valid
             if n_truncate >= first_len // 2:
                 n_truncate = max(1, first_len // 2 - 1)
@@ -837,7 +859,7 @@ def sync_signals(
                     f"setting to {n_truncate}"
                 )
     else:
-        for _ in range(len(signals)):
+        for _ in range(len(signals) - 1):
             init_dt.append(0.0)
         if n_truncate is None:
             n_truncate = 150
@@ -949,7 +971,7 @@ def sync_multiple_twosignals(
             - Must be > 0
         p_lpsd: SpecKit parameters dictionary.
                 Required keys: "olap", "bmin", "Lmin", "Jdes", "Kdes", "order",
-                "win", "psll", "pool". See speckit documentation for details.
+                "win", "psll". See speckit documentation for details.
         init_offsets: Optional list of initial timer offset guesses for each pair.
                      - Length: len(in_signals) - 1 (one per secondary signal)
                      - Each element can be None or a list of length 1

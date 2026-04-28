@@ -33,6 +33,13 @@
 # export authority as may be required before exporting such information to
 # foreign countries or providing access to foreign persons.
 #
+"""Auxiliary numerical helpers for synctools.
+
+The root ``synctools`` namespace is the stable public API. Helpers exported
+from this module are available for expert workflows, examples, and tests, but
+they remain provisional until the v1.0 API policy is finalized.
+"""
+
 import numpy as np
 import numpy.typing as npt
 from typing import Dict, Any, Tuple, List, Optional
@@ -42,6 +49,25 @@ from scipy import integrate
 from speckit import compute_spectrum as lpsd
 import logging
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "build_kaiser_lpf_taps",
+    "combination_2sig",
+    "combination_3sig",
+    "components_for_balancing",
+    "convert_frequency_to_detrended_phase_in_time",
+    "convert_frequency_to_phase_in_asd",
+    "convert_frequency_to_phase_in_time",
+    "convert_phase_to_frequency_in_time",
+    "crop_data",
+    "derive_sign_pairs",
+    "get_asd_delay_factor",
+    "integral_rms",
+    "model_timer_deviation_error",
+    "spectra",
+]
+
+_REQUIRED_LPSD_KEYS = ("olap", "bmin", "Lmin", "Jdes", "Kdes", "order", "win", "psll")
 
 
 def spectra(
@@ -63,6 +89,9 @@ def spectra(
     """
     if fs <= 0:
         raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
+    missing_keys = [key for key in _REQUIRED_LPSD_KEYS if key not in p_lpsd]
+    if missing_keys:
+        raise ValueError(f"p_lpsd is missing required keys: {missing_keys}")
     
     data_len = len(data)
     

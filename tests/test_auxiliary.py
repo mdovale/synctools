@@ -52,6 +52,11 @@ class TestSpectra:
         
         with pytest.raises(ValueError, match="Sampling rate fs must be > 0"):
             spectra(white_noise_signal, 0.0, default_lpsd_params)
+
+    def test_spectra_missing_lpsd_key(self, white_noise_signal):
+        """Missing SpecKit parameters should raise a clear validation error."""
+        with pytest.raises(ValueError, match="p_lpsd is missing required keys"):
+            spectra(white_noise_signal, 1.0, {"olap": "default"})
     
     def test_spectra_sine_wave(self, default_lpsd_params, sample_fs):
         """Test spectra on a sine wave (should show peak at frequency)."""

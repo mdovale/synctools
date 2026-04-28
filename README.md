@@ -1,16 +1,16 @@
 # synctools
 
-Python tools for synchronization of multi-channel measurements.
+Python tools for synchronization of multi-channel data streams via null combinations.
 
 ## Overview
 
-`synctools` is a Python package for synchronizing misaligned time series data. It corrects for static time offsets and clock jitter between different measurement systems or chanels, enabling accurate combination and analysis of multi-channel measurements.
+`synctools` is a Python package for synchronizing misaligned time series data via optimization of null channels. It corrects for static time offsets (and clock jitter, if independently measured) between different measurement systems or channels, enabling accurate combination and analysis of multi-channel measurements. The synchronization method depends on the ability to form null combinations of at least two or at most three signals. In practice, this means that the user has fed the same signal to two measurement instruments or channels (TwoSignal combination, or split measurement), or has performed a three-signal test (ThreeSignal combination, or three-signal test).
 
 The package is designed for applications in precision metrology, interferometry, and gravitational wave detection, where multiple instruments measure signals that need to be synchronized before combination.
 
 ## Features
 
-- **Multi-signal synchronization**: Synchronize combinations of 2 or 3 signals 
+- **Multi-signal synchronization**: Synchronize multi-channel data streams by looking at null combinations of 2 or 3 signals
 - **Time offset correction**: Automatically determine and correct time offsets between signals
 - **Clock jitter handling**: Account for clock jitter using optional clock reference signals
 - **Flexible models**: Support for "total" and "fluc" synchronization models
@@ -103,6 +103,8 @@ t = np.arange(n_samples) / fs
 signal1 = 1e6 + 0.1 * np.sin(2 * np.pi * 0.01 * t)
 signal2 = 1e6 + 0.1 * np.sin(2 * np.pi * 0.01 * t)
 signal3 = 1e6 + 0.1 * np.sin(2 * np.pi * 0.01 * t)
+
+# Reuse the p_lpsd dictionary from the two-signal example above.
 
 # Synchronize three signals
 unsynced, synced = sync_signals(
@@ -205,11 +207,37 @@ Main entry point for signal synchronization.
 **Raises:**
 - `ValueError`: If input validation fails (invalid array shapes, incompatible lengths, etc.).
 
+### Conversion Helpers
+
+The root package also exports two stable conversion helpers:
+
+- `convert_frequency_to_detrended_phase_in_time(data, fs)`: Integrates frequency data to phase and removes a linear phase trend.
+- `convert_phase_to_frequency_in_time(data, fs, prepend=np.nan)`: Differentiates phase data back to frequency.
+
+### sync_multiple_twosignals()
+
+Use `sync_multiple_twosignals()` when you have one reference stream and multiple secondary streams, and each secondary should be synchronized independently against the reference. This is a star-topology batch wrapper around `sync_signals([reference, secondary], ...)`; it is not a joint multi-signal null-combination solver.
+
+**Parameters:**
+- `in_signals` (List[np.ndarray]): List of two or more 1D frequency arrays. The first array is the reference; each remaining array is synchronized against it. All arrays must have the same length.
+- `fs`, `p_lpsd`, `model`, `domain`, `method`, `interp_order`, `n_truncate`, `logger`: Same meaning as in `sync_signals()`.
+- `init_offsets` (Optional[List[Optional[List[float]]]]): One entry per secondary signal. Each entry is either `None` (defaults to `[0.0]`) or a one-element offset list for that pair.
+- `clock_refs` (Optional[List[Optional[np.ndarray]]]): One entry per secondary signal. Each entry is either `None` or a 1D differential clock reference for that pair.
+
+**Returns:**
+- `List[Tuple[TwoSignals, Synchronization]]`: One `(unsynced_obj, synced_obj)` pair for each `[reference, secondary]` synchronization.
+
+Use `sync_signals()` with three input arrays when the measurement is a true three-signal null combination and the offsets should be optimized jointly.
+
+### Advanced Usage
+
+The stable public API is the root `synctools` namespace documented above and exported through `synctools.__all__`. The `synctools.auxiliary` module contains implementation utilities used by the public API; it is currently importable for expert workflows, but symbols outside the root namespace should be treated as provisional until the package reaches v1.0.
+
 ## Examples
 
 See the `notebooks/` directory for detailed examples:
-- `0.1_synctools-testing.ipynb`: Basic synchronization examples
-- `0.2_synctools-testing.ipynb`: Advanced usage examples
+- `0.1_sync_signals.ipynb`: Basic synchronization examples
+- `0.2_three-signals.ipynb`: Three-signal synchronization examples
 
 ## Testing
 

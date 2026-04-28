@@ -20,7 +20,7 @@ class TestSyncSignalsBasic:
         signal1 = 1e6 * np.ones(n_samples)
         signal2 = 1e6 * np.ones(n_samples)
         
-        unsynced, synced = sync_signals(
+        _unsynced, synced = sync_signals(
             [signal1, signal2],
             fs,
             default_lpsd_params,
@@ -72,6 +72,29 @@ class TestSyncSignalsBasic:
         
         with pytest.raises(ValueError, match="Too many input signals"):
             sync_signals([signal, signal, signal, signal], sample_fs, default_lpsd_params)
+
+    def test_sync_signals_default_init_offsets(self, default_lpsd_params, fixed_seed):
+        """Omitted init_offsets should default to one zero offset for two signals."""
+        np.random.seed(fixed_seed)
+        n_samples = 400
+        fs = 10.0
+        signal1 = np.random.randn(n_samples)
+        signal2 = signal1.copy()
+
+        _unsynced, synced = sync_signals(
+            [signal1, signal2],
+            fs,
+            default_lpsd_params,
+            init_offsets=None,
+            model="fluc",
+            domain="time",
+            method="Nelder-Mead",
+            n_truncate=0,
+        )
+
+        assert synced.timer_offsets is not None
+        assert len(synced.timer_offsets) == 1
+        assert len(synced.freq["time"]) == n_samples
 
 
 class TestSyncSignalsKnownOffsets:

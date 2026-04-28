@@ -40,12 +40,17 @@ synctools - Signal synchronization tools
 Public API:
     sync_signals: Main entry point for synchronizing signals (2 or 3 signals)
     sync_multiple_twosignals: Synchronize multiple signals using TwoSignal pairs
+    convert_frequency_to_detrended_phase_in_time: Convert frequency to detrended phase
+    convert_phase_to_frequency_in_time: Convert phase to frequency
     FrequencyData: Class for frequency data
     TimerData: Class for timer data
     Clock: Class for clock measurements
     Synchronization: Class for clock synchronization
     TwoSignals: Class for two-signal combinations
     ThreeSignals: Class for three-signal combinations
+
+The conversion helpers are stable root-package re-exports. Other helpers in
+synctools.auxiliary remain provisional until the v1.0 API policy is finalized.
 """
 
 from synctools.synchronization import sync_signals, sync_multiple_twosignals

@@ -234,7 +234,7 @@ class ThreeSignals:
         for _s, _b in zip(_sigs, _bsigs):
             _name = f"{_s.name}"
             if _b is not None:
-                _name += f"+{_s.name}"
+                _name += f"+{_b.name}"
             _name += ","
             self.name += _name
         self.name += ')'
