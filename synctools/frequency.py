@@ -34,22 +34,110 @@
 # foreign countries or providing access to foreign persons.
 #
 import copy
+from typing import Optional, Tuple, Union
+
 import numpy as np
 import numpy.typing as npt
-from typing import Optional, Tuple
 from pytdi.dsp import timeshift
-import logging
-logger = logging.getLogger(__name__)
 
 from synctools.auxiliary import spectra
+
+
+def _as_1d_float_array(
+    values: npt.ArrayLike,
+    name: str,
+    *,
+    copy_array: bool = False,
+    allow_empty: bool = False,
+) -> npt.NDArray[np.float64]:
+    """Return finite 1D data as ``float64``."""
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be 1D array, got shape {array.shape}")
+    if not allow_empty and array.size == 0:
+        raise ValueError(f"{name} cannot be empty")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values")
+    if copy_array:
+        array = array.copy()
+    return array
+
+
+def _validate_finite_float(value: float, name: str) -> float:
+    """Coerce a numeric scalar to finite ``float``."""
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite numeric scalar, got {value!r}") from exc
+    if not np.isfinite(result):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return result
+
+
+def _validate_positive_float(value: float, name: str) -> float:
+    result = _validate_finite_float(value, name)
+    if result <= 0:
+        raise ValueError(f"Sampling rate {name} must be > 0, got {value}")
+    return result
+
+
+def _validate_non_negative_int(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative, got {value}")
+    return result
+
+
+def _validate_positive_int(value: int, name: str) -> int:
+    result = _validate_non_negative_int(value, name)
+    if result <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return result
+
+
+def _is_real_scalar(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        array = np.asarray(value)
+    except (TypeError, ValueError):
+        return False
+    return array.ndim == 0 and np.issubdtype(array.dtype, np.number) and not np.issubdtype(
+        array.dtype, np.complexfloating
+    )
+
+
+def _as_scalar_or_1d_float_array(
+    value: Union[float, npt.ArrayLike],
+    name: str,
+    expected_length: int,
+) -> Union[float, npt.NDArray[np.float64]]:
+    array = np.asarray(value, dtype=np.float64)
+    if array.ndim == 0:
+        scalar = float(array)
+        if not np.isfinite(scalar):
+            raise ValueError(f"{name} must be finite, got {value!r}")
+        return scalar
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be a scalar or 1D array, got shape {array.shape}")
+    if array.size != expected_length:
+        raise ValueError(
+            f"{name} must have same length as data ({array.size} vs {expected_length})"
+        )
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values")
+    return array
+
 
 class FrequencyData:
     def __init__(
         self,
         main_tot: npt.NDArray[np.float64],
         fs: float,
-        name: str = 'y',
-        order: int = 0
+        name: str = "y",
+        order: int = 0,
     ) -> None:
         """Class for frequency time series data with detrending capabilities.
         
@@ -96,7 +184,8 @@ class FrequencyData:
                 - Units: Hz
             name: Name identifier (same as input).
             order: Polynomial fit order (same as input).
-            p_fit: Polynomial coefficients from fit.
+            p_fit: Polynomial coefficients from fit, ordered from highest degree
+                   to constant term as returned by numpy.polyfit.
                    - Shape: (order+1,)
                    - Units: Hz for coefficient[0], Hz/s for coefficient[1], etc.
             clock_registered: Boolean flag indicating if a clock is registered.
@@ -115,72 +204,118 @@ class FrequencyData:
             >>> print(f"Total: {freq_data.total[0]:.1f} Hz")
             >>> print(f"Fluctuation std: {np.std(freq_data.fluc):.2e} Hz")
         """
-        # Validate inputs
-        if fs <= 0:
-            raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-        
-        main_tot = np.asarray(main_tot, dtype=np.float64)
-        if main_tot.ndim != 1:
-            raise ValueError(f"main_tot must be 1D array, got shape {main_tot.shape}")
-        
-        if len(main_tot) == 0:
-            raise ValueError("main_tot cannot be empty")
-        
-        if order < 0:
-            raise ValueError(f"order must be non-negative, got {order}")
-        
+        fs = _validate_positive_float(fs, "fs")
+        main_tot = _as_1d_float_array(main_tot, "main_tot", copy_array=True)
+        order = _validate_non_negative_int(order, "order")
+        if order >= main_tot.size:
+            raise ValueError(
+                f"order ({order}) must be less than number of samples ({main_tot.size})"
+            )
+
         self.clock_registered = False
-        self.fourier_freq = None
-        self.asd = None
-        self.total = main_tot 
+        self.fourier_freq: Optional[npt.NDArray[np.float64]] = None
+        self.asd: Optional[npt.NDArray[np.float64]] = None
+        self.total = main_tot
         self.fs = fs
         self.name = name
         self.order = order
-        self.tau = np.arange(len(self.total))/fs
+        self.tau = np.arange(self.total.size, dtype=np.float64) / fs
         self.fit, self.p_fit = self.fit_frequency(self.tau, self.total, self.order)
         self.fluc = self.total - self.fit
         # Ensure fluc has zero mean to correct for numerical precision in polynomial fitting
         self.fluc = self.fluc - np.mean(self.fluc)
 
-    def __add__(self, other) -> 'FrequencyData':
+    def __add__(self, other) -> "FrequencyData":
         if isinstance(other, FrequencyData):
-            return FrequencyData(self.total+other.total, self.fs, order=self.order)
-        elif isinstance(other, (float, int)):
-            return FrequencyData(self.total+other, self.fs, order=self.order)
-        else:
-            raise ValueError(f'invalid data type for FrequencyData addition: {type(other)}')
+            self._validate_compatible(other)
+            return FrequencyData(
+                self.total + other.total,
+                self.fs,
+                name=self.name,
+                order=self.order,
+            )
+        if _is_real_scalar(other):
+            return FrequencyData(
+                self.total + float(other),
+                self.fs,
+                name=self.name,
+                order=self.order,
+            )
+        return NotImplemented
 
-    def __sub__(self, other) -> 'FrequencyData':
+    __radd__ = __add__
+
+    def __sub__(self, other) -> "FrequencyData":
         if isinstance(other, FrequencyData):
-            return FrequencyData(self.total-other.total, self.fs, order=self.order)
-        elif isinstance(other, (float, int)):
-            return FrequencyData(self.total-other, self.fs, order=self.order)
-        else:
-            raise ValueError(f'invalid data type for FrequencyData subtraction: {type(other)}')
+            self._validate_compatible(other)
+            return FrequencyData(
+                self.total - other.total,
+                self.fs,
+                name=self.name,
+                order=self.order,
+            )
+        if _is_real_scalar(other):
+            return FrequencyData(
+                self.total - float(other),
+                self.fs,
+                name=self.name,
+                order=self.order,
+            )
+        return NotImplemented
+
+    def __rsub__(self, other) -> "FrequencyData":
+        if _is_real_scalar(other):
+            return FrequencyData(
+                float(other) - self.total,
+                self.fs,
+                name=self.name,
+                order=self.order,
+            )
+        return NotImplemented
 
     def __mul__(self, other):
-        if isinstance(other, float) or isinstance(other, int):
-            return FrequencyData(self.total*other, self.fs, order=self.order)
-        else:
-            raise ValueError(f"invalid data type {type(other)}")
+        if _is_real_scalar(other):
+            return FrequencyData(
+                self.total * float(other),
+                self.fs,
+                name=self.name,
+                order=self.order,
+            )
+        return NotImplemented
 
     def __rmul__(self, other):
-        if isinstance(other, float) or isinstance(other, int):
-            return FrequencyData(self.total*other, self.fs, order=self.order)
-        else:
-            raise ValueError(f"invalid data type {type(other)}")
+        return self.__mul__(other)
 
     def __truediv__(self, other):
-        if isinstance(other, float) or isinstance(other, int):
-            return FrequencyData(self.total/other, self.fs, order=self.order)
-        else:
-            raise ValueError(f"invalid data type {type(other)}")
+        if _is_real_scalar(other):
+            divisor = float(other)
+            if divisor == 0:
+                raise ZeroDivisionError("division by zero")
+            return FrequencyData(
+                self.total / divisor,
+                self.fs,
+                name=self.name,
+                order=self.order,
+            )
+        return NotImplemented
 
+    def _validate_compatible(self, other: "FrequencyData") -> None:
+        if self.total.shape != other.total.shape:
+            raise ValueError(
+                f"FrequencyData objects must have matching shapes "
+                f"({self.total.shape} vs {other.total.shape})"
+            )
+        if not np.isclose(self.fs, other.fs, rtol=0.0, atol=0.0):
+            raise ValueError(
+                f"FrequencyData objects must have matching sampling rates "
+                f"({self.fs} vs {other.fs})"
+            )
+
+    @staticmethod
     def fit_frequency(
-        self,
         tau: npt.NDArray[np.float64],
         data: npt.NDArray[np.float64],
-        order: int = 0
+        order: int = 0,
     ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         """Fit a total frequency with a polynomial function.
         
@@ -194,12 +329,21 @@ class FrequencyData:
             - data_fit: Fitted frequency data (Hz)
             - p_fit: Polynomial coefficients
         """
-        if order < 0:
-            raise ValueError(f"order must be non-negative, got {order}")
-        if len(tau) != len(data):
+        tau = _as_1d_float_array(tau, "tau")
+        data = _as_1d_float_array(data, "data")
+        order = _validate_non_negative_int(order, "order")
+        if tau.size != data.size:
             raise ValueError(
-                f"tau and data must have same length ({len(tau)} vs {len(data)})"
+                f"tau and data must have same length ({tau.size} vs {data.size})"
             )
+        if order >= data.size:
+            raise ValueError(
+                f"order ({order}) must be less than number of samples ({data.size})"
+            )
+        if order == 0:
+            mean = float(np.mean(data, dtype=np.float64))
+            return np.full(data.shape, mean, dtype=np.float64), np.array([mean])
+
         p_fit = np.polyfit(tau, data, deg=order)
         data_fit = np.polyval(p_fit, tau)
         return data_fit, p_fit
@@ -253,11 +397,11 @@ class FrequencyData:
     def timing_transformation(
         self,
         fs: float,
-        timer_offset: float = 0.0,
+        timer_offset: Optional[float] = 0.0,
         interp_order: int = 121,
         n_trunc: int = 150,
         Doppler_type: str = "total",
-        shifts: Optional[npt.NDArray[np.float64]] = None
+        shifts: Optional[npt.NDArray[np.float64]] = None,
     ) -> None:
         """Transform reference time frame to primary using differential clock signal.
         
@@ -273,6 +417,7 @@ class FrequencyData:
             timer_offset: Timer offset to add to clock signal.
                          - Units: seconds
                          - Added to the clock timer before computing shifts
+                         - None is treated as 0.0 for callers that use default offsets
             interp_order: Interpolation order for time-shifting.
                          - Must be positive integer
                          - Typical range: 5-121
@@ -299,7 +444,7 @@ class FrequencyData:
         
         Raises:
             ValueError: If validation fails (invalid fs, interp_order, n_trunc,
-                       Doppler_type, or shifts length mismatch).
+                       Doppler_type, non-finite inputs, or shifts length mismatch).
         
         Note:
             Requires that a clock has been registered via register_differential_clock().
@@ -313,73 +458,82 @@ class FrequencyData:
             ... )
         """
         if not self.clock_registered:
-            raise ValueError("A differential clock must be registered before timing_transformation")
-        if fs <= 0:
-            raise ValueError(f"Sampling rate fs must be > 0, got {fs}")
-        if interp_order <= 0:
-            raise ValueError(f"interp_order must be positive, got {interp_order}")
-        if n_trunc < 0:
-            raise ValueError(f"n_trunc must be non-negative, got {n_trunc}")
-        if n_trunc >= len(self.total) // 2:
             raise ValueError(
-                f"n_trunc ({n_trunc}) must be < len(data) // 2 ({len(self.total) // 2})"
+                "A differential clock must be registered before timing_transformation"
+            )
+        fs = _validate_positive_float(fs, "fs")
+        interp_order = _validate_positive_int(interp_order, "interp_order")
+        n_trunc = _validate_non_negative_int(n_trunc, "n_trunc")
+        if n_trunc >= self.total.size // 2:
+            raise ValueError(
+                f"n_trunc ({n_trunc}) must be < len(data) // 2 ({self.total.size // 2})"
             )
         if Doppler_type not in ("total", "fit"):
             raise ValueError(f"Doppler_type must be 'total' or 'fit', got {Doppler_type}")
         if shifts is not None:
-            shifts = np.asarray(shifts, dtype=np.float64)
-            if len(shifts) != len(self.total):
+            shifts = _as_1d_float_array(shifts, "shifts")
+            if shifts.size != self.total.size:
                 raise ValueError(
-                    f"shifts must have same length as data "
-                    f"({len(shifts)} vs {len(self.total)})"
+                    f"shifts must have same length as data ({shifts.size} vs {self.total.size})"
                 )
+        if timer_offset is None:
+            timer_offset = 0.0
+        else:
+            timer_offset = _validate_finite_float(timer_offset, "timer_offset")
 
         if shifts is None:
             self.diff_clock.add_timer_offset(timer_offset)
-            _shifts = fs*self.diff_clock.tshift.total[self.timer_type]
+            _shifts = fs * self.diff_clock.tshift.total[self.timer_type]
         else:
-            _shifts = copy.copy(shifts)
+            _shifts = shifts.copy()
 
         if self.diff_clock.primary_stamped:
-            Doppler_factor = 1 + getattr(self.diff_clock.rd,Doppler_type)
+            Doppler_factor = 1 + getattr(self.diff_clock.rd, Doppler_type)
         else:
             self.diff_clock.time_stamping(_shifts, factor=1, order=interp_order)
-            Doppler_factor = 1 / (1 + getattr(self.diff_clock.rd,Doppler_type))
+            denominator = 1 + getattr(self.diff_clock.rd, Doppler_type)
+            if np.any(denominator == 0):
+                raise ZeroDivisionError("Doppler factor denominator contains zero")
+            Doppler_factor = 1 / denominator
         self.time_stamping(_shifts, factor=Doppler_factor, order=interp_order)
 
-        # : truncation
         self.diff_clock.truncation(n_trunc)
         self.truncation(n_trunc)
 
-        # : compute a clock correction term for a stochastic analysis mode
-        self.clock_correction_term = self.fit * self.clock_sign*self.diff_clock.rd.fluc / (1 + self.clock_sign*self.diff_clock.rd.fit)
+        denominator = 1 + self.clock_sign * self.diff_clock.rd.fit
+        if np.any(denominator == 0):
+            raise ZeroDivisionError("clock correction denominator contains zero")
+        self.clock_correction_term = (
+            self.fit * self.clock_sign * self.diff_clock.rd.fluc / denominator
+        )
 
     def time_stamping(
         self,
         shifts: npt.NDArray[np.float64],
-        factor: float = 1.0,
-        order: int = 121
+        factor: Union[float, npt.NDArray[np.float64]] = 1.0,
+        order: int = 121,
     ) -> None:
         """Time-stamp all frequencies with interpolation.
         
         Args:
             shifts: Number of (fractional) samples to be shifted. 
                    Must have same length as data.
-            factor: Scaling factor, e.g. Doppler factor due to clock bias (dimensionless)
+            factor: Scalar or per-sample scaling factor, e.g. Doppler factor due
+                    to clock bias (dimensionless)
             order: Interpolation order (positive integer)
         """
-        shifts = np.asarray(shifts, dtype=np.float64)
-        if len(shifts) != len(self.total):
+        shifts = _as_1d_float_array(shifts, "shifts")
+        if shifts.size != self.total.size:
             raise ValueError(
                 f"shifts must have same length as data "
-                f"({len(shifts)} vs {len(self.total)})"
+                f"({shifts.size} vs {self.total.size})"
             )
-        if order <= 0:
-            raise ValueError(f"order must be positive, got {order}")
-        
-        self.total = factor*timeshift(self.total, shifts, order=order)
-        self.fit = factor*timeshift(self.fit, shifts, order=order)
-        self.fluc = factor*timeshift(self.fluc, shifts, order=order)
+        factor = _as_scalar_or_1d_float_array(factor, "factor", self.total.size)
+        order = _validate_positive_int(order, "order")
+
+        self.total = factor * timeshift(self.total, shifts, order=order)
+        self.fit = factor * timeshift(self.fit, shifts, order=order)
+        self.fluc = factor * timeshift(self.fluc, shifts, order=order)
 
     def truncation(self, n_trunc: int) -> None:
         """Truncate both ends of time-series.
@@ -388,15 +542,15 @@ class FrequencyData:
             n_trunc: Number of points to be truncated at each end of array.
                     Must satisfy n_trunc < len(data) // 2.
         """
-        if n_trunc < 0:
-            raise ValueError(f"n_trunc must be non-negative, got {n_trunc}")
+        n_trunc = _validate_non_negative_int(n_trunc, "n_trunc")
         if n_trunc == 0:
             return
-        if n_trunc >= len(self.total) // 2:
+        data_len = self.total.size
+        if n_trunc >= data_len // 2:
             raise ValueError(
-                f"n_trunc ({n_trunc}) must be < len(data) // 2 ({len(self.total) // 2})"
+                f"n_trunc ({n_trunc}) must be < len(data) // 2 ({data_len // 2})"
             )
-        
+
         self.tau = self.tau[n_trunc:-n_trunc]
         self.total = self.total[n_trunc:-n_trunc]
         self.fit = self.fit[n_trunc:-n_trunc]
