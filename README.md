@@ -27,6 +27,12 @@ The package is designed for applications in precision metrology, interferometry,
 - speckit (for spectral analysis)
 - pytdi (for time-shifting operations)
 
+### Install from PyPI
+
+```bash
+pip install synctools
+```
+
 ### Install from source
 
 ```bash
@@ -51,20 +57,16 @@ pip install -e ".[dev]"
 import numpy as np
 from synctools import sync_signals
 
-# Define parameters for spectral analysis
-from speckit import compute_spectrum as lpsd
-from multiprocessing import Pool
-
+# Define parameters for spectral analysis.
 p_lpsd = {
     "olap": "default",
     "bmin": 1,
-    "Lmin": 0,
+    "Lmin": 1,
     "Jdes": 500,
     "Kdes": 100,
     "order": 2,
-    "win": np.kaiser,
+    "win": "Kaiser",
     "psll": 250,
-    "pool": Pool()
 }
 
 # Create two frequency time series (in Hz)
